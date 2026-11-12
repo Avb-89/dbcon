@@ -1,0 +1,620 @@
+@language en
+
+# dbcon
+
+Inspect structure, read, search, and count SQLite records.
+
+## Syntax
+  dbcon [connection] <action> [options]
+  dbcon --db <file> [-r|-w] [--timeout <ms>] <action>
+  dbcon --config <file> <action> [options]
+  dbcon --set-config
+
+Without an action, dbcon opens the interactive shell. A one-shot invocation performs its action and exits.
+
+# GENERAL OPTIONS
+## --db, -db <file> — database
+
+Opens an existing SQLite file for the current run. The path is not saved. Relative paths start from the current directory; **~** expands to the home directory. A missing database is not created.
+
+  dbcon --db ~/data/work.db --tables
+
+## --config <file> — configuration for this run
+
+Loads a JSON configuration. A missing or invalid file is an error. The choice applies only to the current run.
+
+  dbcon --config ./temporary.json --tables
+  dbcon --config ./config.json --db ./other.db --tables
+
+**Precedence.** Explicit **--db**, **-r / -w**, and **--timeout** override the corresponding configuration values. **--db** without **--config** ignores the saved configuration. Configuration selection without these options is described under “Configuration”.
+
+## -r / -w — access mode
+
+**-r** prevents database changes. **-w** opens a connection with read and write access. Specify either flag to select the mode for the current run; combining them is an error.
+
+If neither flag is given, the configuration selects the mode: **readOnly: true** means read-only, **readOnly: false** means read-write. Without a configuration, the database is opened read-only.
+
+## --timeout <ms> — busy timeout
+
+An integer of at least **1000** milliseconds. The default is **3000** unless the configuration specifies another value. Limits waiting for a database lock, not the total query duration.
+
+  dbcon --db ./work.db --timeout 5000 --count -t records
+
+# ACTIONS
+## --tables — tables
+**Syntax:** --tables [names]
+
+Without names, prints the number of tables and their names, one per line. With names, reads those tables, like **--read -t**. Cannot be combined with **--table / -t**.
+
+  dbcon --tables
+  dbcon --tables users,records -n 5 -f
+
+## --columns — column structure
+**Syntax:** --columns -t <tables>
+
+Prints an aligned table: **cid** — column number, **name** — name, **type** — declared type, **notnull** — NOT NULL flag, **dflt_value** — default value, **pk** — position in the primary key.
+
+**Compatibility:** requires selected tables. Does not take column names or combine with reading, searching, or counting. Output is tabular without **-f**; long values are clipped to the terminal width.
+
+  dbcon --columns -t users
+  dbcon --columns --table users,records
+
+## --read — read records
+**Syntax:** --read -t <tables> [-c <fields>] [-n <count>] [-f]
+
+Reads records from the selected tables. **--read** can be omitted when **-t** is present. Without **-c**, prints all fields; without **-n**, all rows. Fields can be JSON paths; output rules are described under “General rules”.
+
+  dbcon --read -t users -c id,name -n 10
+  dbcon -t records -c id,title -n 10 -f
+  dbcon -t records -c data -n 1
+  dbcon --read --table '*' --column '*'
+
+## --search, -s — search records
+**Syntax:** -t <tables> -s <text|field=value> [-s ...] [-i] [-e] [-c <fields>] [-n <count>] [-f]
+
+**Plain-text search.** Finds a case-sensitive substring. Checks fields selected with **-c**, or all fields if **-c** is omitted. A match in any checked field is sufficient.
+
+  dbcon -t records -s report -c title -n 10 -f
+  dbcon -t records -s 'annual report' -c title -n 10
+
+**Case and exact matching.** **-i** ignores case. **-e / --eq / --equal** require the whole value to match. These modes apply to all conditions and require a search. **-ie** and **-ei** are equivalent to **-i -e**.
+
+  dbcon -t records -s Report -c title -ie -n 10
+
+**Field search.** **field=value** checks only the named field; **-c** selects output independently. The first **=** separates the field; further equals signs are part of the search text. An unknown field is an error.
+
+  dbcon -t records -s status=ready --eq -c id,title -n 10 -f
+  dbcon -t records -s 'title=mode=fast' -e -c id,title -n 10
+
+**Multiple conditions — AND.** Repeat **--search** or **-s**: a row must match every condition. Plain-text and field conditions can be combined.
+
+  dbcon -t records -s 'title=annual report' -s status=ready -i -c id,title -n 10
+
+**Two searches: text parts of one session only.** The first condition selects the session; the second selects JSON type **text**. Output contains the message ID and extracted text; **reasoning**, **step-start**, and **step-finish** parts are excluded.
+
+  dbcon -t part \
+    --search session_id=sample_001 \
+    --search 'data:$.type=text' \
+    --equal \
+    --column message_id,'data:$.text' \
+    -n 20
+
+**Details:** numbers are compared as text. NULL does not match. To find empty text, use an empty value with exact matching:
+
+  dbcon -t records -s title= --equal -c id,title -n 10
+
+**Compatibility:** requires tables; cannot be combined with **--read** or **--columns**. With **--count**, counts matches instead of printing records.
+
+## --where — row filter
+
+**Syntax:** --where <expression>
+
+Selects rows by comparison. Repeat the flag to require every expression (AND). Inside one expression, **AND**, **OR**, and parentheses are allowed. Operators are **=**, **!=**, **<>**, **>**, **>=**, **<**, **<=**, **IS NULL**, and **IS NOT NULL**. Quote the expression when it contains spaces.
+
+A field may be a column or a JSON path. An unknown field is an error. An unquoted number is compared as a number; quoted text is compared as text. Values are passed to SQLite as parameters, not inserted into the statement. **--where** does not accept arbitrary SQL.
+
+**AND** has precedence over **OR**; parentheses change the grouping. Use **IS NULL / IS NOT NULL**, not **= NULL**. Quote text that matches a keyword or starts with a digit. Integers must fit in signed 64-bit range; decimal and exponent forms, such as **1.5** or **1e3**, bind as finite numbers. Invalid numbers and missing values are errors.
+
+Inside an expression, quote field names containing spaces. Double a quote to include it in a string value:
+
+  dbcon -t users --where "name = 'O''Brien'" -c id,name -n 5
+
+  dbcon -t part --where 'time_created >= 1794400000000' --where 'time_created < 1794410800000' --order-by time_created -c time_created,'data:$.text' -n 20
+  dbcon --count -t records --where 'status = ready OR title IS NULL'
+
+**Compatibility:** requires a table. Combines with reading, searching, and counting. Cannot list column structure. With a search, both the search and the filter must match.
+
+## --order-by, --sort — sort rows
+
+**Syntax:** --order-by <field [ASC|DESC], ...>
+
+Sorts a read or search. **--sort** is the same flag. The default direction is **ASC**. Separate fields with commas. A field may be a JSON path.
+
+Quote a sort specification containing spaces. Repeated flags append fields in order. Empty comma-separated fields are errors. Add a unique field, such as **id**, after the time field to order rows with the same timestamp consistently.
+
+  dbcon -t records --sort 'time_created DESC, id' -c id,time_created -n 10 -f
+
+**Compatibility:** requires a read or search. It does not apply to counting or column structure.
+
+## --count — count rows
+**Syntax:** --count -t <tables> [-s <condition> ...] [-i] [-e] [-p] [-c <fields>]
+
+Counts all rows, including rows with NULL, zeros, and empty values. Prints a **table / rows** table. With a search, counts only matching rows.
+
+  dbcon --count -t records,users
+  dbcon --count -t records -s status=ready --equal
+
+**Count with two conditions:**
+
+  dbcon --count -t part \
+    -s session_id=sample_001 \
+    -s 'data:$.type=text' --eq
+
+**Non-empty values: -p / --non-empty.** A row counts if at least one checked field is not NULL, numeric zero, empty or whitespace-only text, or an empty BLOB. Text **"0"** is non-empty.
+
+**-c** selects checked fields, including JSON paths; without it, all fields are checked. An ID can make a row non-empty. A whole JSON column is checked as text; a JSON path checks the extracted value.
+
+  dbcon --count -t records -p -c data
+  dbcon --count -t records --non-empty -c 'data:$.text'
+  dbcon --count -t records -s 'data:$.type=text' -e -p -c 'data:$.text'
+
+**Compatibility:** cannot be combined with **--read**, **--columns**, **-n**, or **-f**. Field selection with **-c** requires a search or **-p**. When combining search and **-p**, both checks must match.
+
+## --mcp — local MCP server
+**Syntax:** dbcon --mcp [--db <file> | --config <file>] [--timeout <ms>] [-r]
+
+Runs a read-only MCP server over standard input/output, without a network port. Uses protocol **2025-06-18** and the normal configuration selection rules. The connection is always read-only, including when the configuration says **readOnly: false**. **-w**, other actions, and query flags cannot be combined with **--mcp**; queries are supplied through tool arguments.
+
+  dbcon --mcp
+  dbcon --mcp --db ~/data/work.db
+  dbcon --mcp --config ./config.json
+
+The MCP client launches this command as a subprocess. stdin accepts one JSON-RPC message per line; stdout contains only protocol responses. Startup errors go to stderr. End of input closes the server. The client sends **initialize**, then **notifications/initialized**, before listing or calling tools.
+
+**Tools:**
+**list_tables** — no arguments; returns table names.
+**describe_table** — required **table**; returns columns and the table definition.
+**read_rows** — required **table**; optional **columns**, **search**, **where**, **order_by**, **ignore_case**, **exact**, **limit**.
+**count_rows** — required **table**; optional **columns**, **search**, **where**, **ignore_case**, **exact**, **non_empty**.
+
+Each call selects one literal table name. **columns**, **search**, **where**, and **order_by** are arrays of strings. Names in these arrays are not split on spaces; **order_by** also accepts comma-separated fields. **columns** defaults to all fields. **search** follows **-s** rules, **where** follows **--where**, and **order_by** follows **--sort**. Conditions from **search** and **where** are ANDed. **ignore_case** and **exact** are booleans requiring a nonempty search. **non_empty** follows **-p** rules; count column selection requires **non_empty** or a search.
+
+**limit** is a positive integer, default **100**, for **read_rows** only. Results contain **row_count**, **limit**, and **limit_reached**. A reached limit means more rows may exist, not that another row is guaranteed. Continue using **where** and a stable **order_by**, including a unique field when timestamps repeat.
+
+Tool results contain JSON in both **structuredContent** and a text content block. Text values are complete and timestamps remain unchanged. SQL NULL becomes JSON null; integers and finite real values are JSON numbers. BLOBs use **{"type":"blob","hex":"..."}**; non-finite real values use **{"type":"real","value":"..."}**. JSON-path objects and arrays remain JSON text as returned by SQLite. Client-side handling of large integers depends on the client.
+
+Example **tools/call** params:
+
+  {"name":"read_rows","arguments":{"table":"records","columns":["id","title"],"search":["status=ready"],"exact":true,"order_by":["id ASC"],"limit":10}}
+
+Unknown tools and malformed arguments return JSON-RPC errors. Query errors return a tool result with **isError: true**; the server remains available for the next request.
+
+# GENERAL RULES
+## Tables, fields, and names
+
+**--table / -t <names>** selects tables. **--column / -c <names>** selects fields for reading, plain-text search, or checking non-empty values. All fields are used by default.
+
+Separate names with spaces or commas. Quote names containing spaces. Duplicate names are rejected. **'*'** selects all tables or fields and must be used alone; quotes prevent shell expansion of the asterisk.
+
+  dbcon -t users -c id, name -n 5
+  dbcon -t 'order items' -c 'item name' -n 5
+
+## JSON paths
+
+Use **column:$.path** in **-c** and field searches. **data:$.text** extracts a field, **data:$.meta.author** a nested field, and **data:$.items[0]** the first array item. Quote JSON paths.
+
+  dbcon -t records -c id,'data:$.meta.author','data:$.items[0]' -n 5
+  dbcon -t records -s 'data:$.type=text' -e -c 'data:$.text' -n 10
+
+A missing path, JSON null, or invalid JSON returns NULL. Invalid JSON-path syntax is an error. An existing literal column name takes precedence over JSON notation.
+
+## -n — row limit
+
+**-n <count>** is a positive integer limiting each table's result separately. A search limits matching rows. Available only for reading and searching.
+
+## -f — compact tabular output
+
+Without **-f**, each record is printed as a separate block with field names and complete values. BLOB values are printed in hexadecimal.
+
+**-f** prints one record per line with column headers. Fields share the terminal width: short fields shrink, and long fields take the freed space. Text that does not fit is clipped with an ellipsis. Available only for reading and searching.
+
+  dbcon -t records -c id,title,status -n 10 -f
+  dbcon -t records -s status=ready --equal -c id,title -n 10 -f
+
+# SHELL
+## Starting and executing commands
+
+Without an action, dbcon opens the shell on the selected database. The **read-only:>>** prompt indicates read-only mode; **write:>>** indicates read-write mode.
+
+  dbcon
+  dbcon --db ./work.db -r
+
+A command is buffered until **GO**, either on its own line or at the end of a line after a space. A **;** is allowed before GO. Commands are case-insensitive. Enclose arguments containing spaces in single or double quotes.
+
+GO inside quotes is part of the argument. A command and its flags can span multiple lines. Connection options (**--db**, **--config**, **-r / -w**, **--timeout**) belong to startup; using them inside the shell reports an error.
+
+  SELECT -t records -c id,title -n 5
+  GO
+
+## Shell commands
+
+**TABLES** lists tables. **COLUMNS <table>** and **--columns -t <table>** show structure. **SELECT** reads data; **COUNT <table>** counts rows. Search and flags work as in one-shot invocations.
+
+  TABLES; GO
+  COLUMNS records; GO
+  --columns -t records; GO
+  SELECT -c id,title -t records -n 5 -f; GO
+  SELECT id, title FROM records LIMIT 5; GO
+  -s 'title=annual report' -t records -c id,title -n 5; GO
+  COUNT records -s status=ready --equal; GO
+  COUNT records -p -c 'data:$.text'; GO
+  -s session_id=sample_001 -s 'data:$.type=text' -e -t part -c 'data:$.text' -n 20; GO
+
+The **SELECT fields FROM table LIMIT count** form supports reading a field list from one table; it is not an arbitrary SQL query.
+
+## Errors and exit
+
+Errors are printed inside the shell; another command can be entered afterward. **QUIT** or **EXIT** ends the session without GO. End of input also closes the shell.
+
+# CONFIGURATION
+## --set-config — configuration wizard
+
+Used alone. Selects or creates a configuration and saves its path in **conf/settings.ini**.
+
+  dbcon --set-config
+
+**Configuration file.** Enter **~/data/config.json**, **/absolute/path/config.json**, or **./config.json**. Relative paths start from the current directory. Enter selects **conf/config.json** and offers to create it. For a missing file, confirm creation with **y** at **Create file? [y/N]**; **n**, Enter, or end of input cancels creation.
+
+An existing valid configuration is selected without overwriting it. An invalid configuration prompts for replacement.
+
+**Database settings.** When creating a configuration, supply the path to an existing database, then **readOnly** and **busyTimeoutMilliseconds**. Enter keeps the displayed default. An empty or invalid database path stops the wizard without creating files. A relative database path starts from the JSON directory.
+
+## JSON format
+
+**databasePath** — required path to an existing database; **~** expands, and relative paths start from the configuration directory.
+**readOnly** — default access mode.
+**busyTimeoutMilliseconds** — wait for a busy database in milliseconds, minimum **1000**.
+
+  {
+    "databasePath": "~/data/work.db",
+    "readOnly": true,
+    "busyTimeoutMilliseconds": 3000
+  }
+
+## Default configuration selection
+
+Without **--db** or **--config**, dbcon uses the path in **conf/settings.ini**, or **conf/config.json** if no path is saved. An error in the saved configuration does not trigger a fallback. If no configuration is found, the program exits with an error.
+
+# FILES
+  dbcon/
+    bin/dbcon
+    conf/config.json
+    conf/settings.ini
+
+**settings.ini** is optional and contains one assignment, **configPath=config.json**. The path is relative to **conf**. Lines starting with **#** or **;** are ignored; other entries are not allowed.
+
+If the binary is inside **bin**, **conf** is a sibling of **bin**; otherwise, it is beside the binary.
+
+# HELP
+**-h / --help** prints a short summary without opening the database. **--man [en|ru]** prints the full manual; English is used if no language is specified. Both actions must be used alone.
+
+  dbcon --help
+  dbcon --man ru
+  dbcon --man en
+
+@language ru
+
+# dbcon
+
+Просмотр структуры, чтение, поиск и подсчёт записей SQLite.
+
+## Синтаксис
+
+  dbcon [подключение] <действие> [параметры]
+  dbcon --db <файл> [-r|-w] [--timeout <мс>] <действие>
+  dbcon --config <файл> <действие> [параметры]
+  dbcon --set-config
+
+Без действия открывается интерактивная оболочка. Разовый запуск выполняет действие и завершается.
+
+# ОБЩИЕ ПАРАМЕТРЫ
+
+## --db, -db <файл> — база данных
+
+Открывает существующий файл SQLite на текущий запуск. Путь не сохраняется. Относительный путь считается от текущей папки; **~** раскрывается в домашнюю папку. Отсутствующая база не создаётся.
+
+  dbcon --db ~/data/work.db --tables
+
+## --config <файл> — конфигурация запуска
+
+Загружает JSON-конфигурацию. Отсутствующий или некорректный файл вызывает ошибку. Выбор действует только на текущий запуск.
+
+  dbcon --config ./temporary.json --tables
+  dbcon --config ./config.json --db ./other.db --tables
+
+**Приоритет.** Явные **--db**, **-r / -w** и **--timeout** заменяют соответствующие значения конфигурации. **--db** без **--config** игнорирует сохранённую конфигурацию. Выбор конфигурации без этих параметров описан в разделе «Конфигурация».
+
+## -r / -w — режим доступа
+
+**-r** запрещает изменения базы. **-w** открывает соединение с правом чтения и записи. Укажите один из этих флагов, чтобы выбрать режим на текущий запуск; вместе они вызывают ошибку.
+
+Если ни один флаг не указан, режим берётся из конфигурации: **readOnly: true** — только чтение, **readOnly: false** — чтение и запись. Если конфигурация не используется, база открывается только для чтения.
+
+## --timeout <мс> — ожидание занятой базы
+
+Целое число от **1000** миллисекунд. По умолчанию **3000**, если конфигурация не задаёт другое значение. Ограничивает ожидание блокировки базы, а не длительность запроса.
+
+  dbcon --db ./work.db --timeout 5000 --count -t records
+
+# ДЕЙСТВИЯ
+
+## --tables — таблицы
+
+**Синтаксис:** --tables [имена]
+
+Без имён выводит количество таблиц и их названия, по одному на строку. С именами читает названные таблицы, как **--read -t**. Не сочетается с **--table / -t**.
+
+  dbcon --tables
+  dbcon --tables users,records -n 5 -f
+
+## --columns — структура колонок
+
+**Синтаксис:** --columns -t <таблицы>
+
+Выводит выровненную таблицу: **cid** — номер, **name** — имя, **type** — объявленный тип, **notnull** — признак NOT NULL, **dflt_value** — значение по умолчанию, **pk** — позиция в первичном ключе.
+
+**Совместимость:** требует выбранные таблицы. Не принимает имена колонок и не сочетается с чтением, поиском или подсчётом. Формат табличный без **-f**; длинные значения обрезаются по ширине терминала.
+
+  dbcon --columns -t users
+  dbcon --columns --table users,records
+
+## --read — чтение записей
+
+**Синтаксис:** --read -t <таблицы> [-c <поля>] [-n <число>] [-f]
+
+Читает записи выбранных таблиц. **--read** можно опустить при наличии **-t**. Без **-c** выводятся все поля; без **-n** — все строки. Поля могут быть JSON-путями; правила вывода приведены в разделе «Общие правила».
+
+  dbcon --read -t users -c id,name -n 10
+  dbcon -t records -c id,title -n 10 -f
+  dbcon -t records -c data -n 1
+  dbcon --read --table '*' --column '*'
+
+## --search, -s — поиск записей
+
+**Синтаксис:** -t <таблицы> -s <текст|поле=значение> [-s ...] [-i] [-e] [-c <поля>] [-n <число>] [-f]
+
+**Простой поиск.** Ищет подстроку с учётом регистра. Проверяет поля из **-c**, а без **-c** — все поля. Достаточно совпадения в одном из проверяемых полей.
+
+  dbcon -t records -s report -c title -n 10 -f
+  dbcon -t records -s 'annual report' -c title -n 10
+
+**Регистр и точное совпадение.** **-i** отключает учёт регистра. **-e / --eq / --equal** требуют совпадения всего значения. Режимы действуют на все условия запроса и используются только с поиском. **-ie** и **-ei** равнозначны **-i -e**.
+
+  dbcon -t records -s Report -c title -ie -n 10
+
+**Поиск по полю.** В форме **поле=значение** проверяется только указанное поле; **-c** независимо выбирает вывод. Первый **=** отделяет поле, остальные входят в искомый текст. Неизвестное поле вызывает ошибку.
+
+  dbcon -t records -s status=ready --eq -c id,title -n 10 -f
+  dbcon -t records -s 'title=mode=fast' -e -c id,title -n 10
+
+**Несколько условий — И.** Повторяйте **--search** или **-s**: строка должна соответствовать каждому условию. Простые и адресные условия можно сочетать.
+
+  dbcon -t records -s 'title=annual report' -s status=ready -i -c id,title -n 10
+
+**Двойной поиск: только текстовые части одной сессии.** Первое условие выбирает сессию, второе — JSON-тип **text**. В вывод попадают ID сообщения и извлечённый текст; части **reasoning**, **step-start** и **step-finish** исключаются.
+
+  dbcon -t part \
+    --search session_id=sample_001 \
+    --search 'data:$.type=text' \
+    --equal \
+    --column message_id,'data:$.text' \
+    -n 20
+
+**Особенности:** числа сравниваются как текст. NULL не совпадает. Для поиска пустого текста используйте пустое значение с точным совпадением:
+
+  dbcon -t records -s title= --equal -c id,title -n 10
+
+**Совместимость:** требует таблицы; не сочетается с **--read** или **--columns**. С **--count** считает совпадения вместо вывода записей.
+
+## --where — отбор строк
+
+**Синтаксис:** --where <выражение>
+
+Отбирает строки сравнением. Повторите флаг, чтобы потребовать все выражения (И). Внутри одного выражения допускаются **AND**, **OR** и скобки. Операторы: **=**, **!=**, **<>**, **>**, **>=**, **<**, **<=**, **IS NULL** и **IS NOT NULL**. Выражение с пробелами берите в кавычки.
+
+Поле может быть колонкой или JSON-путём. Неизвестное поле — ошибка. Число без кавычек сравнивается как число, текст в кавычках — как текст. Значения передаются в SQLite параметрами и не вставляются в текст запроса. Произвольный SQL не принимается.
+
+**AND** имеет приоритет перед **OR**; скобки меняют группировку. Для NULL используйте **IS NULL / IS NOT NULL**, а не **= NULL**. Текст, совпадающий с ключевым словом или начинающийся с цифры, заключайте в кавычки. Целые числа должны помещаться в знаковое 64-битное значение; дробные и экспоненциальные формы, например **1.5** или **1e3**, передаются как конечные числа. Неверное число или отсутствующее значение вызывает ошибку.
+
+Внутри выражения имена полей с пробелами заключайте в кавычки. Чтобы включить кавычку в строковое значение, удвойте её:
+
+  dbcon -t users --where "name = 'O''Brien'" -c id,name -n 5
+
+  dbcon -t part --where 'time_created >= 1794400000000' --where 'time_created < 1794410800000' --order-by time_created -c time_created,'data:$.text' -n 20
+  dbcon --count -t records --where 'status = ready OR title IS NULL'
+
+**Совместимость:** требует таблицу. Сочетается с чтением, поиском и подсчётом. Не сочетается с просмотром структуры. Вместе с поиском должны совпасть и поиск, и фильтр.
+
+## --order-by, --sort — сортировка строк
+
+**Синтаксис:** --order-by <поле [ASC|DESC], ...>
+
+Сортирует чтение или поиск. **--sort** означает то же самое. Направление по умолчанию — **ASC**. Поля разделяются запятыми. Поле может быть JSON-путём.
+
+Выражение сортировки с пробелами заключайте в кавычки. Повторные флаги дополняют список полей в указанном порядке. Пустые элементы между запятыми вызывают ошибку. Добавляйте уникальное поле, например **id**, после поля времени, чтобы однозначно упорядочить строки с одинаковым временем.
+
+  dbcon -t records --sort 'time_created DESC, id' -c id,time_created -n 10 -f
+
+**Совместимость:** требует чтение или поиск. Не применяется к подсчёту и просмотру структуры.
+
+## --count — подсчёт строк
+
+**Синтаксис:** --count -t <таблицы> [-s <условие> ...] [-i] [-e] [-p] [-c <поля>]
+
+Считает все строки, включая строки с NULL, нулями и пустыми значениями. Выводит таблицу **table / rows**. С поиском считает только совпавшие строки.
+
+  dbcon --count -t records,users
+  dbcon --count -t records -s status=ready --equal
+
+**Подсчёт с двумя условиями:**
+
+  dbcon --count -t part \
+    -s session_id=sample_001 \
+    -s 'data:$.type=text' --eq
+
+**Заполненность: -p / --non-empty.** Строка учитывается, если хотя бы одно проверяемое поле не является NULL, числовым нулём, пустым или пробельным текстом либо пустым BLOB. Текст **"0"** считается заполненным.
+
+**-c** выбирает проверяемые поля, включая JSON-пути; без него проверяются все поля. Наличие ID может сделать строку заполненной. Вся JSON-колонка проверяется как текст, JSON-путь — как извлечённое значение.
+
+  dbcon --count -t records -p -c data
+  dbcon --count -t records --non-empty -c 'data:$.text'
+  dbcon --count -t records -s 'data:$.type=text' -e -p -c 'data:$.text'
+
+**Совместимость:** не сочетается с **--read**, **--columns**, **-n** или **-f**. Выбор полей через **-c** требует поиска или **-p**. При сочетании поиска и **-p** должны выполняться обе проверки.
+
+## --mcp — локальный MCP-сервер
+**Синтаксис:** dbcon --mcp [--db <файл> | --config <файл>] [--timeout <мс>] [-r]
+
+Запускает MCP-сервер только для чтения через стандартные потоки ввода/вывода, без сетевого порта. Использует протокол **2025-06-18** и обычные правила выбора конфигурации. Соединение всегда открывается только для чтения, даже при **readOnly: false** в конфигурации. **-w**, другие действия и флаги запросов не сочетаются с **--mcp**; параметры запросов передаются через инструменты.
+
+  dbcon --mcp
+  dbcon --mcp --db ~/data/work.db
+  dbcon --mcp --config ./config.json
+
+MCP-клиент запускает эту команду отдельным процессом. stdin принимает по одному JSON-RPC-сообщению на строку; stdout содержит только ответы протокола. Ошибки запуска отправляются в stderr. Конец ввода завершает сервер. До запроса списка инструментов и их вызова клиент отправляет **initialize**, затем **notifications/initialized**.
+
+**Инструменты:**
+**list_tables** — без аргументов; возвращает имена таблиц.
+**describe_table** — обязательный **table**; возвращает колонки и определение таблицы.
+**read_rows** — обязательный **table**; необязательные **columns**, **search**, **where**, **order_by**, **ignore_case**, **exact**, **limit**.
+**count_rows** — обязательный **table**; необязательные **columns**, **search**, **where**, **ignore_case**, **exact**, **non_empty**.
+
+Один вызов выбирает одну таблицу по буквальному имени. **columns**, **search**, **where** и **order_by** — массивы строк. Имена в массивах не разбиваются по пробелам; **order_by** также принимает поля через запятую. **columns** по умолчанию выбирает все поля. **search** соответствует **-s**, **where** — **--where**, **order_by** — **--sort**. Условия из **search** и **where** соединяются И. **ignore_case** и **exact** — логические значения, требующие непустого поиска. **non_empty** соответствует **-p**; выбор колонок при подсчёте требует **non_empty** или поиска.
+
+**limit** — положительное целое число, по умолчанию **100**, только для **read_rows**. Результат содержит **row_count**, **limit** и **limit_reached**. Достигнутый лимит означает, что строки могут продолжаться, но не гарантирует следующую строку. Для следующей порции используйте **where** и однозначный **order_by**, добавляя уникальное поле при одинаковом времени.
+
+Результат инструмента содержит JSON в **structuredContent** и в текстовом блоке. Текст возвращается полностью, временные метки не преобразуются. SQL NULL становится JSON null; целые и конечные дробные значения — JSON-числами. BLOB передаётся как **{"type":"blob","hex":"..."}**, неконечное число — как **{"type":"real","value":"..."}**. Объекты и массивы JSON-путей остаются JSON-текстом, возвращённым SQLite. Обработка больших целых зависит от клиента.
+
+Пример params для **tools/call**:
+
+  {"name":"read_rows","arguments":{"table":"records","columns":["id","title"],"search":["status=ready"],"exact":true,"order_by":["id ASC"],"limit":10}}
+
+Неизвестный инструмент или неверный формат аргументов возвращает ошибку JSON-RPC. Ошибка запроса возвращает результат инструмента с **isError: true**; сервер продолжает принимать запросы.
+
+# ОБЩИЕ ПРАВИЛА
+
+## Таблицы, поля и имена
+
+**--table / -t <имена>** выбирает таблицы. **--column / -c <имена>** выбирает поля для чтения, простого поиска или проверки заполненности. По умолчанию используются все поля.
+
+Имена разделяются пробелами или запятыми. Имя с пробелом заключайте в кавычки. Повторные имена отклоняются. **'*'** выбирает все таблицы или поля и используется отдельно; кавычки предотвращают раскрытие звёздочки командной оболочкой.
+
+  dbcon -t users -c id, name -n 5
+  dbcon -t 'order items' -c 'item name' -n 5
+
+## JSON-пути
+
+Форма **колонка:$.путь** используется в **-c** и адресном поиске. **data:$.text** извлекает поле, **data:$.meta.author** — вложенное поле, **data:$.items[0]** — первый элемент массива. JSON-пути заключайте в кавычки.
+
+  dbcon -t records -c id,'data:$.meta.author','data:$.items[0]' -n 5
+  dbcon -t records -s 'data:$.type=text' -e -c 'data:$.text' -n 10
+
+Отсутствующий путь, JSON null и некорректный JSON дают NULL. Ошибочный синтаксис JSON-пути вызывает ошибку. Существующее буквальное имя колонки имеет приоритет перед JSON-обозначением.
+
+## -n — ограничение количества строк
+
+**-n <число>** — положительное целое число, ограничивает результат каждой таблицы отдельно. При поиске ограничиваются совпавшие строки. Доступен только при чтении и поиске.
+
+## -f — компактный табличный вывод
+
+Без **-f** запись выводится отдельным блоком с названиями полей и полными значениями. BLOB выводится в шестнадцатеричном виде.
+
+**-f** — одна запись на строку с заголовками колонок. Поля делят ширину терминала: короткие сжимаются, длинные получают свободное место. Неуместившийся текст обрезается с многоточием. Доступен только при чтении и поиске.
+
+  dbcon -t records -c id,title,status -n 10 -f
+  dbcon -t records -s status=ready --equal -c id,title -n 10 -f
+
+# ОБОЛОЧКА
+
+## Запуск и выполнение
+
+Без действия программа открывает оболочку с выбранной базой. Приглашение **read-only:>>** обозначает режим чтения, **write:>>** — режим чтения и записи.
+
+  dbcon
+  dbcon --db ./work.db -r
+
+Команда накапливается до **GO**: на отдельной строке или в конце строки через пробел. Перед GO допускается **;**. Регистр команд не учитывается. Аргументы с пробелами заключайте в одинарные или двойные кавычки.
+
+GO внутри кавычек является частью аргумента. Команду и её флаги можно вводить на нескольких строках. Параметры подключения (**--db**, **--config**, **-r / -w**, **--timeout**) задаются при запуске; внутри оболочки они вызывают ошибку.
+
+  SELECT -t records -c id,title -n 5
+  GO
+
+## Команды оболочки
+
+**TABLES** перечисляет таблицы. **COLUMNS <таблица>** и **--columns -t <таблица>** показывают структуру. **SELECT** читает данные, **COUNT <таблица>** считает строки. Поиск и флаги применяются так же, как в разовом запуске.
+
+  TABLES; GO
+  COLUMNS records; GO
+  --columns -t records; GO
+  SELECT -c id,title -t records -n 5 -f; GO
+  SELECT id, title FROM records LIMIT 5; GO
+  -s 'title=annual report' -t records -c id,title -n 5; GO
+  COUNT records -s status=ready --equal; GO
+  COUNT records -p -c 'data:$.text'; GO
+  -s session_id=sample_001 -s 'data:$.type=text' -e -t part -c 'data:$.text' -n 20; GO
+
+Форма **SELECT поля FROM таблица LIMIT число** поддерживает чтение списка полей одной таблицы; это не произвольный SQL-запрос.
+
+## Ошибки и выход
+
+Ошибка печатается в оболочке, после неё можно вводить следующую команду. **QUIT** или **EXIT** завершает сеанс без GO. Конец потока ввода также завершает оболочку.
+
+# КОНФИГУРАЦИЯ
+
+## --set-config — мастер настройки
+
+Запускается отдельно от других параметров. Выбирает или создаёт конфигурацию и сохраняет её путь в **conf/settings.ini**.
+
+  dbcon --set-config
+
+**Файл конфигурации.** Введите **~/data/config.json**, **/absolute/path/config.json** или **./config.json**. Относительный путь считается от текущей папки. Enter выбирает **conf/config.json** и предлагает создание. Для отсутствующего файла создание подтверждается ответом **y** на **Create file? [y/N]**; **n**, Enter или конец ввода отменяют создание.
+
+Существующая корректная конфигурация выбирается без перезаписи. Для некорректной предлагается замена.
+
+**Параметры базы.** При создании укажите путь к существующей базе, затем **readOnly** и **busyTimeoutMilliseconds**. Enter оставляет показанное значение по умолчанию. Пустой или неверный путь к базе останавливает мастер без создания файлов. Относительный путь к базе считается от папки JSON.
+
+## Формат JSON
+
+**databasePath** — обязательный путь к существующей базе; **~** раскрывается, относительный путь считается от папки конфигурации.
+**readOnly** — режим доступа по умолчанию.
+**busyTimeoutMilliseconds** — ожидание занятой базы в миллисекундах, минимум **1000**.
+
+  {
+    "databasePath": "~/data/work.db",
+    "readOnly": true,
+    "busyTimeoutMilliseconds": 3000
+  }
+
+## Выбор основной конфигурации
+
+Без **--db** и **--config** используется путь из **conf/settings.ini**, затем **conf/config.json**, если сохранённый путь не задан. Ошибка сохранённой конфигурации не вызывает перехода к другой. Если конфигурация не найдена, программа завершается с ошибкой.
+
+# ФАЙЛЫ
+
+  dbcon/
+    bin/dbcon
+    conf/config.json
+    conf/settings.ini
+
+**settings.ini** необязателен и содержит одно присваивание **configPath=config.json**. Путь считается от **conf**. Строки, начинающиеся с **#** или **;**, игнорируются; другие записи не допускаются.
+
+Если бинарник находится в **bin**, папка **conf** соседняя с **bin**; иначе она располагается рядом с бинарником.
+
+# СПРАВКА
+
+**-h / --help** — краткая справка без открытия базы. **--man [en|ru]** — полное руководство; без языка используется английский. Оба действия запускаются отдельно от других параметров.
+
+  dbcon --help
+  dbcon --man ru
+  dbcon --man en
