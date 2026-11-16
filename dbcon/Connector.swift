@@ -16,17 +16,6 @@ struct Connector {
         let busyTimeoutMilliseconds: Int32
     }
 
-    private enum StartupError: LocalizedError {
-        case invalidConfiguration(String)
-
-        var errorDescription: String? {
-            switch self {
-            case let .invalidConfiguration(message):
-                return message
-            }
-        }
-    }
-
     static func main() {
         do {
             let arguments = try Arguments(Array(CommandLine.arguments.dropFirst()))
@@ -67,14 +56,18 @@ struct Connector {
             } else if let configuration, let configurationURL {
                 databaseURL = fileURL(configuration.databasePath, relativeTo: configurationURL.deletingLastPathComponent())
             } else {
-                throw StartupError.invalidConfiguration(Man.connectionHint)
+                throw StartupError.invalidConfiguration(Errors.Configuration.connectionHint)
             }
 
             let inspector = try DatabaseInspector(
                 databasePath: databaseURL.standardizedFileURL.path,
-                readOnly: arguments.action == .mcp ? true : (arguments.readOnly ?? configuration?.readOnly ?? true),
+                readOnly: arguments.readOnly ?? true,
                 busyTimeoutMilliseconds: arguments.busyTimeout ?? configuration?.busyTimeoutMilliseconds ?? 3000
             )
+            if let command = arguments.searchCommand {
+                try SearchCLI.run(command, inspector: inspector)
+                return
+            }
             switch arguments.action {
             case .help, .setConfiguration, .manual:
                 break
@@ -83,10 +76,12 @@ struct Connector {
             case .shell:
                 try Shell.run(
                     inspector: inspector,
-                    readOnly: arguments.readOnly ?? configuration?.readOnly ?? true
+                    readOnly: arguments.readOnly ?? true
                 )
             case .tables:
                 try inspector.listTables()
+            case .insert, .update, .delete:
+                try inspector.write(arguments)
             case .columns:
                 try inspector.showColumns(tables: arguments.tableNames)
             case .count:
@@ -114,7 +109,7 @@ struct Connector {
                 )
             }
         } catch {
-            let message = "Error: \(error.localizedDescription)\n"
+            let message = Errors.format(error.localizedDescription) + "\n"
             FileHandle.standardError.write(Data(message.utf8))
             exit(EXIT_FAILURE)
         }
@@ -122,7 +117,7 @@ struct Connector {
 
     private static func configurationDirectory() throws -> URL {
         guard let executable = Bundle.main.executableURL else {
-            throw StartupError.invalidConfiguration("Could not determine the executable location.")
+            throw StartupError.invalidConfiguration(Errors.Configuration.noExecutable)
         }
         let directory = executable.deletingLastPathComponent()
         let root = directory.lastPathComponent == "bin" ? directory.deletingLastPathComponent() : directory
@@ -142,14 +137,14 @@ struct Connector {
         do {
             configuration = try JSONDecoder().decode(Configuration.self, from: Data(contentsOf: url))
         } catch {
-            throw StartupError.invalidConfiguration("Cannot load configuration '\(url.path)': \(error.localizedDescription)")
+            throw StartupError.invalidConfiguration(Errors.Configuration.loadFailed(url.path, detail: error.localizedDescription))
         }
         guard !configuration.databasePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !configuration.databasePath.contains("\0"), configuration.databasePath != "Your base" else {
-            throw StartupError.invalidConfiguration("Set a valid databasePath in '\(url.path)'.")
+            throw StartupError.invalidConfiguration(Errors.Configuration.databasePathRequired(url.path))
         }
         guard configuration.busyTimeoutMilliseconds >= 1000 else {
-            throw StartupError.invalidConfiguration("busyTimeoutMilliseconds must be at least 1000 in '\(url.path)'.")
+            throw StartupError.invalidConfiguration(Errors.Configuration.timeoutRequired(url.path))
         }
         return configuration
     }
@@ -162,11 +157,11 @@ struct Connector {
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty && !$0.hasPrefix("#") && !$0.hasPrefix(";") }
             guard lines.count == 1, let line = lines.first, line.hasPrefix("configPath=") else {
-                throw StartupError.invalidConfiguration("Invalid settings file: \(settings.path). Expected configPath=<path>.")
+                throw StartupError.invalidConfiguration(Errors.Configuration.settingsFormat(settings.path))
             }
             let path = String(line.dropFirst("configPath=".count))
             guard !path.isEmpty, !path.contains("\0") else {
-                throw StartupError.invalidConfiguration("Invalid configPath in '\(settings.path)'.")
+                throw StartupError.invalidConfiguration(Errors.Configuration.settingsPath(settings.path))
             }
             return fileURL(path, relativeTo: directory)
         }
@@ -174,11 +169,9 @@ struct Connector {
         return FileManager.default.fileExists(atPath: fallback.path) ? fallback : nil
     }
 
-    private static let nothingCreated = "Nothing was created."
-
     private static func runConfigurationWizard(directory: URL) throws {
         guard isatty(STDIN_FILENO) != 0 else {
-            throw StartupError.invalidConfiguration("dbcon --set-config requires an interactive terminal.")
+            throw StartupError.invalidConfiguration(Errors.Configuration.interactiveRequired)
         }
         let choice = try chooseConfigurationURL(directory: directory)
         if !choice.create, try useExistingConfiguration(choice.url, directory: directory) {
@@ -186,11 +179,10 @@ struct Connector {
         }
         let configURL = choice.url
         let databasePath = try askDatabasePath(configURL: configURL)
-        let readOnly = try askBool("readOnly [true]: ", defaultValue: true)
         let timeout = try askTimeout("busyTimeoutMilliseconds [3000]: ", defaultValue: 3000)
         let configuration = Configuration(
             databasePath: databasePath,
-            readOnly: readOnly,
+            readOnly: true,
             busyTimeoutMilliseconds: timeout
         )
         try FileManager.default.createDirectory(
@@ -206,22 +198,22 @@ struct Connector {
     private static func chooseConfigurationURL(directory: URL) throws -> (url: URL, create: Bool) {
         let defaultURL = directory.appendingPathComponent("config.json")
         guard let answer = ask("Configuration file [/path/to/json/config.json]: ") else {
-            throw StartupError.invalidConfiguration(nothingCreated)
+            throw StartupError.invalidConfiguration(Errors.Configuration.nothingCreated)
         }
         let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.contains("\0"), !trimmed.contains("\n"), !trimmed.contains("\r") else {
-            throw StartupError.invalidConfiguration("Invalid configuration path.\n\(nothingCreated)")
+            throw StartupError.invalidConfiguration(Errors.Configuration.invalidPath)
         }
         let url = trimmed.isEmpty ? defaultURL : fileURL(trimmed)
         if isDirectory(url) {
-            throw StartupError.invalidConfiguration("Not a configuration file: \(url.path)\n\(nothingCreated)")
+            throw StartupError.invalidConfiguration(Errors.Configuration.notAFile(url.path))
         }
         if trimmed.isEmpty || !FileManager.default.fileExists(atPath: url.path) {
             if !trimmed.isEmpty {
-                print("Configuration file was not found: \(url.path)")
+                print(Errors.Configuration.notFound(url.path))
             }
             guard try confirmed("Create file? [y/N]: ") else {
-                throw StartupError.invalidConfiguration(nothingCreated)
+                throw StartupError.invalidConfiguration(Errors.Configuration.nothingCreated)
             }
             return (url, true)
         }
@@ -238,9 +230,9 @@ struct Connector {
             print("Settings saved: \(directory.appendingPathComponent("settings.ini").path)")
             return true
         }
-        print("Cannot load configuration: \(url.path)")
+        print(Errors.Configuration.cannotLoad(url.path))
         guard try confirmed("Replace it? [y/n]: ") else {
-            throw StartupError.invalidConfiguration(nothingCreated)
+            throw StartupError.invalidConfiguration(Errors.Configuration.nothingCreated)
         }
         return false
     }
@@ -250,18 +242,7 @@ struct Connector {
         let resolved = fileURL(answer, relativeTo: configURL.deletingLastPathComponent())
         guard !answer.isEmpty, !answer.contains("\0"), !answer.contains("\n"), !answer.contains("\r"), answer != "Your base",
               !isDirectory(resolved), FileManager.default.fileExists(atPath: resolved.path) else {
-            throw StartupError.invalidConfiguration("""
-            Invalid database path.
-            The path must name an existing SQLite file.
-            Examples:
-              ~/data/work.db
-              /absolute/path/work.db
-              ./work.db
-            A relative path is resolved from the directory that contains the JSON file, not from the current directory.
-            Start the wizard again with:
-              dbcon --set-config
-            \(nothingCreated)
-            """)
+            throw StartupError.invalidConfiguration(Errors.Configuration.databasePathHelp)
         }
         return answer
     }
@@ -269,7 +250,7 @@ struct Connector {
     private static func askBool(_ prompt: String, defaultValue: Bool) throws -> Bool {
         while true {
             guard let answer = ask(prompt)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
-                throw StartupError.invalidConfiguration(nothingCreated)
+                throw StartupError.invalidConfiguration(Errors.Configuration.nothingCreated)
             }
             if answer.isEmpty {
                 return defaultValue
@@ -280,7 +261,7 @@ struct Connector {
             case "false", "no", "n", "0":
                 return false
             default:
-                print("Enter true or false.")
+                print(Errors.Configuration.booleanRequired)
             }
         }
     }
@@ -288,7 +269,7 @@ struct Connector {
     private static func askTimeout(_ prompt: String, defaultValue: Int32) throws -> Int32 {
         while true {
             guard let answer = ask(prompt)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
-                throw StartupError.invalidConfiguration(nothingCreated)
+                throw StartupError.invalidConfiguration(Errors.Configuration.nothingCreated)
             }
             if answer.isEmpty {
                 return defaultValue
@@ -296,7 +277,7 @@ struct Connector {
             if let value = Int32(answer), value >= 1000 {
                 return value
             }
-            print("Enter at least 1000.")
+            print(Errors.Configuration.timeoutInput)
         }
     }
 
@@ -311,7 +292,7 @@ struct Connector {
             if answer == "y" || answer == "yes" {
                 return true
             }
-            print("Enter y or n.")
+            print(Errors.Configuration.confirmationRequired)
         }
     }
 
@@ -351,7 +332,7 @@ struct Connector {
         let components = Array(repeating: "..", count: base.count - shared) + Array(target.dropFirst(shared))
         let relativePath = components.joined(separator: "/")
         guard !relativePath.isEmpty, !relativePath.contains("\n"), !relativePath.contains("\r") else {
-            throw StartupError.invalidConfiguration("Configuration paths must not contain line breaks.")
+            throw StartupError.invalidConfiguration(Errors.Configuration.lineBreaks)
         }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try "configPath=\(relativePath)\n".write(

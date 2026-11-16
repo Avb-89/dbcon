@@ -2,7 +2,7 @@
 
 # dbcon
 
-Inspect structure, read, search, and count SQLite records.
+Inspect structure, read, search, count, and modify SQLite records. The shell accepts SQLite SQL as well as flags.
 
 ## Syntax
   dbcon [connection] <action> [options]
@@ -26,13 +26,13 @@ Loads a JSON configuration. A missing or invalid file is an error. The choice ap
   dbcon --config ./temporary.json --tables
   dbcon --config ./config.json --db ./other.db --tables
 
-**Precedence.** Explicit **--db**, **-r / -w**, and **--timeout** override the corresponding configuration values. **--db** without **--config** ignores the saved configuration. Configuration selection without these options is described under “Configuration”.
+**Precedence.** Explicit **--db** and **--timeout** override the corresponding configuration values. Writing requires the startup flag **-w**, regardless of the saved **readOnly** value. **--db** without **--config** ignores the saved configuration. Configuration selection without these options is described under “Configuration”.
 
 ## -r / -w — access mode
 
 **-r** prevents database changes. **-w** opens a connection with read and write access. Specify either flag to select the mode for the current run; combining them is an error.
 
-If neither flag is given, the configuration selects the mode: **readOnly: true** means read-only, **readOnly: false** means read-write. Without a configuration, the database is opened read-only.
+If neither flag is given, CLI/shell opens the database read-only. An older configuration containing **readOnly: false** does not enable writing: pass **-w** explicitly. Reading is available in both modes. MCP requires an explicit **-r** or **-w**.
 
 ## --timeout <ms> — busy timeout
 
@@ -122,7 +122,7 @@ Inside an expression, quote field names containing spaces. Double a quote to inc
   dbcon -t part --where 'time_created >= 1794400000000' --where 'time_created < 1794410800000' --order-by time_created -c time_created,'data:$.text' -n 20
   dbcon --count -t records --where 'status = ready OR title IS NULL'
 
-**Compatibility:** requires a table. Combines with reading, searching, and counting. Cannot list column structure. With a search, both the search and the filter must match.
+**Compatibility:** requires a table. Combines with reading, searching, counting, updating, and deleting. Cannot list column structure or insert records. With a search, both the search and the filter must match.
 
 ## --order-by, --sort — sort rows
 
@@ -160,14 +160,81 @@ Counts all rows, including rows with NULL, zeros, and empty values. Prints a **t
 
 **Compatibility:** cannot be combined with **--read**, **--columns**, **-n**, or **-f**. Field selection with **-c** requires a search or **-p**. When combining search and **-p**, both checks must match.
 
+## --insert, -I — insert records
+
+**Syntax:** --insert -t <table> [-c <columns>] --values <SQL expressions>
+
+Requires **-w** and exactly one literal table name. Select columns with **--column / -c**; omitted columns use SQLite defaults. Without **-c**, values follow SQLite's table column order. **-I** is uppercase; lowercase **-i** remains case-insensitive search.
+
+**--values** supplies a comma-separated list of SQL values or expressions. SQL strings use single quotes, embedded single quotes are doubled, numbers are unquoted, and **NULL** is SQL NULL. The outer double quotes below protect the argument in the terminal or dbcon shell; they do not replace the inner SQL quotes.
+
+  dbcon --db ./work.db -w --insert -t users -c id,name,age --values "1,'Vasya',30"
+  dbcon --db ./work.db -w -I -t users -c id,name,age --values "2,'O''Brien',NULL"
+
+## --update, -u — update records
+
+**Syntax:** --update -t <table> --set <SQL assignments> [--where <filter> ...]
+
+Requires **-w** and exactly one literal table. **--set** supplies SQL assignments, including expressions using current row values. **--where** follows the checked filter grammar described above; repeated filters are ANDed. **Without --where, every row in the table is updated**, as with SQL without WHERE.
+
+  dbcon --db ./work.db -w --update -t users --set "name='Vasya',age=31" --where "id=1"
+  dbcon --db ./work.db -w -u -t users --set "age=age+1" --where "id=2"
+
+## --delete — delete records
+
+**Syntax:** --delete -t <table> [--where <filter> ...]
+
+Requires **-w** and exactly one literal table. There is no short alias. **Without --where, every row in the table is deleted.** The table itself remains.
+
+  dbcon --db ./work.db -w --delete -t users --where "id=2"
+
+**Write compatibility.** Choose one write action. It does not combine with reading, searching, counting, sorting, **-n**, or **-f**. **--values** belongs to insert; **--set** belongs to update. Update/delete do not take **-c**. Table wildcards are not accepted. JSON-path write targets are not supported by these flags; use SQL SQLite JSON functions in the shell.
+
+**Saving.** A one-shot CLI write commits automatically on success. On failure it rolls back and returns a nonzero exit code. The same flags work inside the shell, but changes stay pending until **SAVE** or SQL **COMMIT**. **CANCEL** rolls back the pending transaction. SAVE/CANCEL are shell commands, not CLI flags.
+
+**SQL inputs.** **--set**, **--values**, and direct shell SQL intentionally accept SQL, not just literal data. Do not concatenate untrusted input into them. Values in **--where** remain bound parameters. Write flags accept one generated SQL statement; direct shell SQL accepts batches.
+
+## --find — ranked episode search (CLI and shell)
+
+**Syntax:** --find -t <table> --key <columns> -c <text fields> [-s <literal>] [--require 'a|b'] [options]
+
+The existing **-s/--search**, including field=value, retains its behavior when no advanced flags are used. **--find** explicitly selects the new engine; advanced flags such as --key also select it. In this mode -s is literal text, not field=value. One table and explicit text/key fields are required. No natural-language interpretation, inferred synonyms, saved profiles, new files/tables/indexes, or writes. Keys are verified unique and non-NULL across the table. Composite keys and WITHOUT ROWID work. CLI/shell and MCP use the same engine.
+
+- **-s** repeats mandatory conditions; **--mode any** combines these entries as alternatives. Default all. **--require 'a|b'** adds a mandatory alternatives group; repeat it for AND. A literal pipe is supported through -s, not inside --require alternatives. **--phrase <text>** adds a mandatory phrase. At most 32 conditions, 32 alternatives per group. **--exclude <text>** rejects a matching row and breaks the local episode so conditions cannot bridge it. Repeatable literal terms/phrases are not split on commas or spaces.
+- **--match substring|word|phrase|whole** (default substring) selects substring, word-boundary text, boundary-delimited phrase or entire normalized value. Word and phrase both require boundaries; a multiword entry remains one literal sequence. Mandatory --phrase always searches a boundary-delimited phrase. **-i** ignores case (default sensitive); **-e/-ie** select whole value, optionally ignoring case. Canonical Unicode composition and whitespace-run normalization are used; **--literal-space** disables whitespace normalization, **--fold-yo** enables Russian ё/е equivalence. No spelling correction, stemming, transliteration or model loading.
+- **-c** accepts ordinary columns/JSON paths and one [*] per selector, e.g. 'data:$.content[*].text'. After [*], .name and [nonnegative index] steps are supported. **--element-type text** limits wildcard elements by exact type; repeat for alternatives. **--element-type-field <name>** selects the type property, default type. Without allowed types all elements are eligible. Only strings are searched; missing/invalid JSON and other value types add no text. Results identify the actual array index. These selectors do not extend SQL --where or ordinary -s.
+- **--where** filters source rows using the existing restricted grammar; use explicit author/time/scope filters. **--group-by <fields> --window <1..50> --order-by <fields>** permits conditions across neighboring eligible text rows of the same exact group. Default window 1. A NULL group never combines rows. Rows without selected text do not count. Groups are traversed ascending, then the chosen order/key tie-breakers; ordering is not inferred from physical storage. **--max-gap <seconds>** optionally breaks a window across adjacent timestamps and requires numeric --time-column with --time-unit seconds/milliseconds; range 1..604800, omitted means no time-gap limit. A bounded row window alone is not a time limit.
+- Ranking uses the best evidence once per condition, not repetition frequency: 1000 per condition plus best substring 100/boundary 140/whole value +60/phrase +100. **--priority <fields>** doubles matching quality in these search selectors. A shorter eligible-row span adds up to 100 points, and a one-row episode adds up to 100 per field for proximity of selected first matches. The shortest satisfying suffix of each window is considered. Per-group selection defaults to one best episode; allowing multiple episodes can return overlapping windows. Episodes are not merged into entire conversations. **--rank relevance|fields** selects score or traversal order; fields requires --order-by. Ties follow traversal order. Scores are not confidence probabilities.
+- **--meta <fields>** includes raw metadata. **--time-column <field> --time-unit seconds|milliseconds|iso8601 [--time-zone UTC]** adds explicit formatting while preserving raw values. The time zone must be an IANA identifier; ISO text needs T and Z/an offset. Invalid eligible timestamps are errors; NULL formats as null. Filters and order still use raw stored values. Comma-separate names for --key/--group-by/--priority/--meta; quote names containing spaces.
+- **-n 10** (1..100) limits candidate episodes; **--offset 0** (0..10000) paginates. **--snippet 240** (16..4000) bounds each field excerpt in Swift Characters, not bytes/tokens. Actual original start/end offsets are zero-based/end-exclusive. An excerpt may not show every match; evidence provides exact paths/offsets. **--max-bytes 16000** (1024..1000000) bounds the structured result including metadata, not exact human formatting or MCP overhead. Truncation/continuation is explicit; oversized first candidates or exact metadata cause an error. Offset exhaustion above 10000 requires narrower filters. Each call uses a read transaction, not a persistent cross-page snapshot.
+- Human output is default; **-f** shortens displayed excerpts to 120 Characters, **--json** returns structured data. Terminal controls in human text are escaped. Results contain keys, group, score, evidence and matching messages; they do not dump whole conversations. Relevance is determined by the explicit conditions, not the tool guessing the user's intention.
+
+Example for records(id, conversation_id, created, body):
+
+**--per-group 1** (0..100) returns at most one best episode per explicit group by default; 0 removes this cap. It does not merge independent episodes. Without group-by each row is a separate group. The limit is applied before pagination.
+
+  dbcon --db ./work.db --find -t records --key id -c body --require 'txt' --require 'chat|history' -i --group-by conversation_id --window 4 --order-by 'created ASC' -n 5
+
+## --context — originals and neighboring text
+
+**Syntax:** --context -t <table> --key <columns> -c <text fields> --anchor <filter> --order-by <fields> [--where <scope>] [--before 2] [--after 2] [--full]
+
+--anchor repeats with AND and must select exactly one row within --where. --where also scopes neighbors: set it explicitly to avoid crossing conversation boundaries. Before/after are 0..50 eligible text rows in the chosen order, not necessarily earlier/later wall-clock time. Default 2 each. Technical rows without selected text, including excluded array element types, do not count. --full returns original selected text; otherwise fields are excerpted from the start. The output budget still applies. Exact keys remain intact. -c array selectors, --element-type, --meta, time formatting, -n, --offset, --snippet, --max-bytes, -f and --json work as above.
+
+For a cross-table equality relation, add **--source-table <table> --source-field <field> --related-field <field>**. The source table defaults to the target table. --anchor then selects one source row independently of target --where; key columns belong to the target. NULL relation values are rejected. --before/--after are not accepted in related mode. This is one explicit relation, not arbitrary JOIN or automatic traversal.
+
+  dbcon --db ./work.db --context -t records --key id -c body --anchor 'id = 42' --where "conversation_id = 'example'" --order-by 'created ASC' --before 2 --after 0 --full
+
+In shell, use the same flags without --db or other startup options, then GO. Existing SQL and old flag commands remain unchanged.
+
 ## --mcp — local MCP server
-**Syntax:** dbcon --mcp [--db <file> | --config <file>] [--timeout <ms>] [-r]
+**Syntax:** dbcon --mcp (-r | -w) [--db <file> | --config <file>] [--timeout <ms>]
 
-Runs a read-only MCP server over standard input/output, without a network port. Uses protocol **2025-06-18** and the normal configuration selection rules. The connection is always read-only, including when the configuration says **readOnly: false**. **-w**, other actions, and query flags cannot be combined with **--mcp**; queries are supplied through tool arguments.
+Runs an MCP server over standard input/output, without a network port. Uses protocol **2025-06-18** and the normal configuration selection rules. Exactly one explicit access flag is required: **-r** for reading, **-w** for reading and writing; the configuration cannot supply this choice. Bare **--mcp** is an error. Other actions and query flags cannot be combined with **--mcp**; queries are supplied through tool arguments. In read-only mode write tools are neither advertised nor callable, and SQLite is opened read-only. This does not restrict other programs or ordinary CLI launches available to the agent through a terminal.
 
-  dbcon --mcp
-  dbcon --mcp --db ~/data/work.db
-  dbcon --mcp --config ./config.json
+  dbcon --mcp -r
+  dbcon --mcp -r --db ~/data/work.db
+  dbcon --mcp -w --config ./config.json
 
 The MCP client launches this command as a subprocess. stdin accepts one JSON-RPC message per line; stdout contains only protocol responses. Startup errors go to stderr. End of input closes the server. The client sends **initialize**, then **notifications/initialized**, before listing or calling tools.
 
@@ -176,18 +243,119 @@ The MCP client launches this command as a subprocess. stdin accepts one JSON-RPC
 **describe_table** — required **table**; returns columns and the table definition.
 **read_rows** — required **table**; optional **columns**, **search**, **where**, **order_by**, **ignore_case**, **exact**, **limit**.
 **count_rows** — required **table**; optional **columns**, **search**, **where**, **ignore_case**, **exact**, **non_empty**.
+**search_rows** — ranked, bounded search excerpts; see the dedicated section below.
+**read_context** — scoped neighboring or explicitly related rows; see below.
 
-Each call selects one literal table name. **columns**, **search**, **where**, and **order_by** are arrays of strings. Names in these arrays are not split on spaces; **order_by** also accepts comma-separated fields. **columns** defaults to all fields. **search** follows **-s** rules, **where** follows **--where**, and **order_by** follows **--sort**. Conditions from **search** and **where** are ANDed. **ignore_case** and **exact** are booleans requiring a nonempty search. **non_empty** follows **-p** rules; count column selection requires **non_empty** or a search.
+Each read/count call selects one literal table name. **columns**, **search**, **where**, and **order_by** are arrays of strings. Names in these arrays are not split on spaces; **order_by** also accepts comma-separated fields. **columns** defaults to all fields. **search** follows **-s** rules, **where** follows **--where**, and **order_by** follows **--sort**. Conditions from **search** and **where** are ANDed. **ignore_case** and **exact** are booleans requiring a nonempty search. **non_empty** follows **-p** rules; count column selection requires **non_empty** or a search.
 
 **limit** is a positive integer, default **100**, for **read_rows** only. Results contain **row_count**, **limit**, and **limit_reached**. A reached limit means more rows may exist, not that another row is guaranteed. Continue using **where** and a stable **order_by**, including a unique field when timestamps repeat.
 
-Tool results contain JSON in both **structuredContent** and a text content block. Text values are complete and timestamps remain unchanged. SQL NULL becomes JSON null; integers and finite real values are JSON numbers. BLOBs use **{"type":"blob","hex":"..."}**; non-finite real values use **{"type":"real","value":"..."}**. JSON-path objects and arrays remain JSON text as returned by SQLite. Client-side handling of large integers depends on the client.
+Tool results contain JSON in both **structuredContent** and a text content block. In **read_rows**, text values are complete and timestamps remain unchanged. **search_rows/read_context** return explicit excerpts and optional declared time formatting. SQL NULL becomes JSON null; integers and finite real values are JSON numbers. BLOBs use **{"type":"blob","hex":"..."}**; non-finite real values use **{"type":"real","value":"..."}**. JSON-path objects and arrays remain JSON text as returned by SQLite. Client-side handling of large integers depends on the client.
 
 Example **tools/call** params:
 
   {"name":"read_rows","arguments":{"table":"records","columns":["id","title"],"search":["status=ready"],"exact":true,"order_by":["id ASC"],"limit":10}}
 
 Unknown tools and malformed arguments return JSON-RPC errors. Query errors return a tool result with **isError: true**; the server remains available for the next request.
+
+### search_rows — ranked excerpts (1.1.0)
+
+This read-only tool does not change **read_rows**, create indexes/tables/files, or load dictionaries/models. It scans filtered rows; speed optimization is not part of this feature. Key verification and sorting can be expensive. Each call uses one read transaction; a long call can retain a WAL snapshot. Available in both **-r** and **-w**.
+
+Required: **table**, **key_columns**, **search_columns**. At least one **search**, **required_groups** or **phrases** condition is required. Semantics are exactly those of CLI --find above, including explicit unique non-NULL keys. **search_columns** supports ordinary fields and one [*] expansion; **element_types** and **element_type_field** filter array element types. Metadata/group/time fields do not accept [*]. No inferred rowid, application schema or conversation boundaries.
+
+**search** entries are literal, not field=value. **mode: all|any** combines these entries; **required_groups** contains mandatory pipe-separated alternatives groups; **phrases** adds mandatory literal phrases. **exclude** rejects a row and breaks an episode. **group_by**, **window_rows** and **order_by** enable cross-row conditions within a bounded explicit group; **max_gap_seconds** adds an optional numeric timestamp gap limit. Omitted window_rows is 1, omitted max_gap_seconds adds no time limit.
+
+**match: substring|word|phrase|whole** follows CLI --match. Defaults: **ignore_case false**, **normalize_space true**, **fold_yo false**. where/order_by retain raw SQLite semantics. Excerpts preserve original text; neither synonyms nor approximate matching are inferred.
+
+**priority_columns** doubles matching quality in the chosen search selectors. **sort: relevance** (default) or **fields** follows CLI --rank. Scores count best evidence once per condition and reward locality as described above, not repeated term frequency. Group fields precede order_by/key in traversal and tie order. No semantic understanding or confidence probabilities.
+
+Results represent local candidate episodes, selected by **per_group** (default 1, 0..100, 0 removes the cap). Multiple episodes can overlap; they are never merged into entire conversations. Each result has **key**, **end_key**, **group**, **score**, **span_rows**, **evidence** and **messages**. Each evidence item identifies a condition/query, exact source key, concrete field path, method, original offsets and quality. Messages contain exact keys, excerpts and optional metadata/time. **scanned_rows** counts SQL-filtered rows; **eligible_rows** counts rows with selected text; **matching_source_rows** counts non-excluded source rows matching any positive condition; **matched_windows** counts satisfying windows considered before per-group/top-limit selection, not unique final candidates.
+
+**metadata_columns** returns explicitly chosen values unchanged; default none. **time_column** requires **time_unit: seconds | milliseconds | iso8601**; **time_zone** defaults to **UTC** and accepts an IANA identifier. Numeric units require numeric values. ISO-8601 text must include T and Z/an explicit offset. NULL yields null formatting; invalid matching timestamps cause an error, not a guessed date. **time** contains field, raw, formatted and time_zone. where/order_by still use the raw stored value.
+
+Defaults/ranges: **limit 10 (1..100)**, **offset 0 (0..10000)**, **window_rows 1 (1..50)**, **snippet_chars 240 (16..4000)**, **max_bytes 16000 (1024..1000000)**. String arrays allow up to 32 distinct entries. Excerpts have original zero-based/end-exclusive Swift Character offsets and truncated_before/truncated_after. **position** is the 1-based rank in this query, not a permanent record number. Excerpts may omit other evidence positions; retrieve originals when needed.
+
+**max_bytes** bounds the structured result, not token use or the MCP envelope. **budget_reached**, **has_more**, **next_offset** and **offset_limit_reached** provide explicit continuation under the same rules as CLI. Oversized first candidates/exact metadata cause errors. Pagination reruns the query; concurrent changes can shift pages. There is no cross-call snapshot.
+
+Example tools/call params for a table **records(id, body, conversation_id, created)**:
+
+  {"name":"search_rows","arguments":{"table":"records","key_columns":["id"],"search_columns":["body"],"search":["car","automobile"],"mode":"any","ignore_case":true,"group_by":["conversation_id"],"order_by":["created DESC"],"time_column":"created","time_unit":"milliseconds","limit":5,"max_bytes":8000}}
+
+### read_context — bounded context (1.1.0)
+
+Required: **table**, **key_columns**, **anchor_where**, **text_columns**. This is the same engine as CLI --context. **text_columns** supports one [*] expansion with **element_types/element_type_field**. Only rows with selected string text count as neighbors. **full: true** returns the selected original text within max_bytes; otherwise snippet_chars clips from the start. Anchor ambiguity, missing anchors and anchors with no selected text are errors. Other arguments, explicit source/target relations and pagination follow the CLI section above. Use read_rows for complete arbitrary typed fields.
+
+Neighbor mode requires **order_by**. **where** scopes both the anchor and neighbors (for example, one conversation); **anchor_where** adds the exact anchor key. Defaults: **before 2**, **after 2**, each **0..50**. The anchor is included, with **relative_position: 0**; negative/positive positions identify preceding/following rows in the chosen order, not necessarily earlier/later wall-clock time. Key columns break ties. Context is scoped explicitly; the tool never infers conversation boundaries.
+
+Related mode requires **source_field** and **related_field** together; **source_table** defaults to table. **anchor_where** identifies one source row, independently of target **where**. The target's related_field is compared to the source's scalar source_field using SQLite equality. NULL source values are rejected. Pass the target table's key_columns; before/after are not accepted in this mode. This supports one explicit relation, not arbitrary JOINs or recursive graph traversal.
+
+Both modes use **limit 10 (1..100)** and **offset 0 (0..10000)** within the selected context window/relation, and return results, row_count, has_more, next_offset and budget_reached. Pagination does not retain a cross-call snapshot. Every result has an exact key, a position in the current context selection, clipped fields and optional metadata/time.
+
+  {"name":"read_context","arguments":{"table":"records","key_columns":["id"],"anchor_where":["id = 42"],"where":["conversation_id = 'example'"],"text_columns":["body"],"order_by":["created ASC"],"before":2,"after":3,"snippet_chars":1000}}
+  {"name":"read_context","arguments":{"table":"records","key_columns":["id"],"source_table":"conversations","anchor_where":["id = 'example'"],"source_field":"id","related_field":"conversation_id","text_columns":["body"],"order_by":["created ASC"],"limit":10}}
+
+**Write tools (-w only; new in 1.1.0):**
+**insert_rows** — required **table**, **values**; optional **columns**, **returning**. **values** is a nonempty array of SQL expression lists: each string describes one row, without outer parentheses. **columns** lists existing literal columns; omit it to use table order. To insert text, quote it as SQLite text, doubling internal single quotes. SQL NULL is written as **NULL**, not JSON null.
+**update_rows** — required **table**, **set**, and either nonempty **where** or **all_rows: true**. **set** is one SQL assignment list, just like CLI **--set**.
+**delete_rows** — required **table** and either nonempty **where** or **all_rows: true**.
+**write_batch** — required nonempty **operations** array. Each object has **action** (insert/update/delete), **table**, and the same arguments as the corresponding write tool, without the tool name. Different operations can target different tables in the selected database. Extra or inappropriate arguments are rejected.
+
+**where** uses the restricted read filter syntax. **all_rows** and a nonempty **where** are mutually exclusive. Empty values/columns/returning arrays are rejected. Write/returning columns are literal names, not JSON paths or '*'. SQL expressions in **values** and **set** have the same trust requirements as CLI expressions: never interpolate untrusted text without SQL quoting. Each operation accepts one SQL statement, not a semicolon-separated batch. User transaction commands, schema changes, ATTACH/DETACH, and PRAGMA are not separate MCP tools.
+
+Each write call opens one transaction and commits automatically only after all operations succeed. Any preparation, execution, or commit error rolls back the entire call, including preceding operations. No SAVE/CANCEL or pending transaction is shared between calls. The first failed operation stops the batch. A lost connection after commit can lose the response, not the saved changes: inspect the database before retrying non-idempotent writes.
+
+Success contains **committed: true**, **operation_count**, and **operations**. Each operation has its 1-based **operation** number, **action**, **table**, **rows_changed** (SQLite direct change count), and **rows_changed_including_triggers** (SQLite total-change delta). These count SQLite changes, not necessarily distinct values changed; SQLite rules for triggers, views, and foreign-key actions apply. No modified data is echoed by default. Optional **returning** requests literal fields through SQLite RETURNING and adds **returned_rows**, using the same typed representation as reads. This may return many complete rows; there is no implicit output limit. RETURNING requires SQLite 3.35.0+ and follows its limitations, including values before subsequent AFTER-trigger changes. Generated IDs are obtained by requesting their columns, not guessed from a global last-insert ID.
+
+Failure contains **isError: true**, the 1-based failed operation and the underlying error, plus confirmation of full rollback. Operation **0** means the transaction could not start. A commit failure is reported against the last operation. If rollback itself fails, the response says so rather than claiming success, and the MCP connection closes.
+
+Example tool arguments for an existing **users(id, name, age)** table (use a test copy):
+
+  {"name":"insert_rows","arguments":{"table":"users","columns":["id","name","age"],"values":["101, 'Alice', 35","102, 'O''Brien', 40"],"returning":["id"]}}
+  {"name":"write_batch","arguments":{"operations":[{"action":"update","table":"users","set":"age = age + 1","where":["id = 101"]},{"action":"delete","table":"users","where":["id = 102"]}]}}
+
+## Connecting to OpenCode
+
+The following uses OpenCode V2 configuration; the old V1 shape placed server names directly under **mcp**. Preserve unrelated settings and adapt an existing connection rather than adding a duplicate. The new dbcon arguments require **-r** or **-w**, including for connections created with dbcon 1.0.0.
+
+1. Install dbcon at **~/.local/bin/dbcon**, following the README installation instructions. If installed elsewhere, adjust the binary path below. Use the new build, not an older installed binary. The default OpenCode database is **~/.local/share/opencode/opencode.db**; **OPENCODE_DB** can override its location. Keep the history connection read-only and test writing on a separate copy.
+2. Open the global configuration **~/.config/opencode/opencode.jsonc** (or the existing **opencode.json**). Add **dbcon** inside **mcp.servers**; if these objects do not exist, add them. This is a complete minimal configuration, not a replacement for an existing file:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "dbcon": {
+        "type": "local",
+        "command": [
+          "{env:HOME}/.local/bin/dbcon",
+          "--mcp",
+          "-r",
+          "--db",
+          "{env:HOME}/.local/share/opencode/opencode.db"
+        ]
+      }
+    }
+  }
+}
+```
+
+Each argument is a separate JSON string. OpenCode replaces **{env:HOME}** with the HOME environment variable; ordinary **$HOME** is not expanded inside JSON strings. In an existing file, separate neighboring properties with commas. **--db** selects the database explicitly, so the dbcon connection does not depend on its saved configuration or the client's working directory. If OpenCode uses a non-default database, replace the database path with its actual location.
+
+3. Alternatively, add the same connection with the OpenCode CLI (do not do both):
+
+  opencode mcp add dbcon --global -- "$HOME/.local/bin/dbcon" --mcp -r --db "$HOME/.local/share/opencode/opencode.db"
+
+4. Save and check:
+
+  opencode mcp list
+
+OpenCode starts dbcon automatically and exposes its tools; you do not need a separate terminal running dbcon. V2 reloads configuration automatically; use **/reload** if necessary. The **/mcps** interface shows connection status. Ask: "Use dbcon to list tables and describe the session table." In **-r**, source version 1.1.0 provides six reading tools and no writing tools (published 1.0.0 has four).
+
+5. To enable writing, change the connection's **-r** string to **-w**, select a test database with **--db**, and reconnect the MCP server so the process restarts with the new arguments. Four additional write tools should appear. Never test writes on the live OpenCode history. A terminal's ordinary **dbcon -w** is independent of this MCP connection.
+
+Documentation: https://opencode.ai/docs/mcp-servers
 
 # GENERAL RULES
 ## Tables, fields, and names
@@ -226,10 +394,14 @@ Without **-f**, each record is printed as a separate block with field names and 
 
 Without an action, dbcon opens the shell on the selected database. The **read-only:>>** prompt indicates read-only mode; **write:>>** indicates read-write mode.
 
+The prompt appears before a new command, not before each line of a multiline command. Piped input has no prompts; it still uses shell transaction rules.
+
   dbcon
   dbcon --db ./work.db -r
 
-A command is buffered until **GO**, either on its own line or at the end of a line after a space. A **;** is allowed before GO. Commands are case-insensitive. Enclose arguments containing spaces in single or double quotes.
+A command is buffered until **GO**, either on its own line or at the end of a line after a space. SQL keywords and shell command words are case-insensitive; flags retain their case (**-I** differs from **-i**). Enclose flag arguments containing spaces in single or double quotes. Direct SQL follows SQLite quoting rules.
+
+**Semicolons.** Separate SQL statements in a batch with **;**. The last statement before GO may omit its semicolon. GO starts execution; a semicolon alone does not. Semicolons and GO inside SQL strings are data, not command delimiters.
 
 GO inside quotes is part of the argument. A command and its flags can span multiple lines. Connection options (**--db**, **--config**, **-r / -w**, **--timeout**) belong to startup; using them inside the shell reports an error.
 
@@ -250,11 +422,63 @@ GO inside quotes is part of the argument. A command and its flags can span multi
   COUNT records -p -c 'data:$.text'; GO
   -s session_id=sample_001 -s 'data:$.type=text' -e -t part -c 'data:$.text' -n 20; GO
 
-The **SELECT fields FROM table LIMIT count** form supports reading a field list from one table; it is not an arbitrary SQL query.
+**SQL and flags.** SQL is passed directly to SQLite, not translated into flags. The legacy **SELECT -t ...** form is also retained. Use SQL syntax for SQL statements and flag syntax for flag commands; GO executes either form.
+
+  SELECT id, name, age FROM users WHERE age >= 18 ORDER BY id LIMIT 10;
+  GO
+
+## Writes, transactions, and savepoints
+
+Start with **dbcon --db ./work.db -w**. Ordinary writes start a transaction automatically if none is open. SQL and flag writes share that transaction.
+
+  UPDATE users SET age = 31 WHERE id = 1;
+  UPDATE users SET age = 40 WHERE id = 2;
+  GO
+  SAVE
+
+**SAVE / save** commits pending changes. **CANCEL / cancel** rolls them back. Both commands also execute on their own without GO. After saving or cancelling, the next ordinary write starts a new transaction. Native SQL **BEGIN**, **COMMIT**, **ROLLBACK**, **SAVEPOINT**, **ROLLBACK TO**, and **RELEASE** are processed by SQLite through GO.
+
+  BEGIN;
+  UPDATE users SET age = 31 WHERE id = 1;
+  SAVEPOINT second_change;
+  UPDATE users SET age = 99 WHERE id = 2;
+  ROLLBACK TO second_change;
+  RELEASE second_change;
+  COMMIT;
+  GO
+
+Here the first update is saved and the second is cancelled. SQL transaction commands retain SQLite semantics: releasing an outermost SAVEPOINT that itself opened a transaction commits it. SAVE/CANCEL are conveniences, not a replacement for SQL transactions.
+
+A batch stops at its first error; subsequent statements are not executed. Earlier successful changes can remain pending. Inspect them and use SAVE or CANCEL deliberately. Syntax errors and SQL constraint violations are reported by SQLite without dbcon guessing corrections.
+
+## PRAGMA and database selection
+
+PRAGMA is available as SQL in the shell, without flag aliases. In read-only mode, inspection PRAGMAs are allowed; settings and other maintenance operations require **-w**. A writable session accepts SQLite PRAGMAs with their native semantics.
+
+  PRAGMA table_info(users);
+  GO
+
+  PRAGMA foreign_keys = ON;
+  PRAGMA foreign_keys;
+  GO
+
+Set connection options such as foreign_keys before starting a transaction. Some PRAGMAs affect only the connection, execute during preparation, or do not participate in rollback. Do not assume CANCEL reverses a PRAGMA setting.
+
+The session works with one database selected at startup. ATTACH/DETACH are disabled. To use a different file, exit and start **dbcon --db <file>** or **dbcon --config <file>**.
 
 ## Errors and exit
 
-Errors are printed inside the shell; another command can be entered afterward. **QUIT** or **EXIT** ends the session without GO. End of input also closes the shell.
+Errors are printed inside the shell; another command can be entered afterward. **QUIT** or **EXIT** ends the session without GO when no command is being buffered. End of input also closes the shell. Unsaved changes are rolled back without confirmation; an unfinished command without GO is discarded.
+
+**Read-only controls.** SAVE in read-only mode reports an error and instructs you to restart with **-w**. CANCEL reports that no changes were made and cancellation is unnecessary; this is informational, not an error. Transaction/savepoint commands and PRAGMAs that are not allowed in read-only mode explain the required access mode. ATTACH/DETACH explain how to select another database at startup. The unsupported **-d** flag points to **--delete**.
+
+**SQLite diagnostics.** SQL syntax and constraint errors retain SQLite's own messages. Database open/access errors include the database path, primary and extended SQLite codes, and an operating-system error when SQLite supplies one. The additional system code is diagnostic information, not a guaranteed explanation of the cause. Do not infer a missing file, permissions problem, or WAL problem solely from that detail.
+
+**A pipe still runs the shell.** Starting dbcon without an action in its flags selects shell mode even when stdin comes from a pipe. To keep a piped SQL write, explicitly save it:
+
+  printf '%s\n' "UPDATE users SET age=31 WHERE id=1; GO" SAVE | dbcon --db ./work.db -w
+
+Without SAVE or SQL COMMIT, end of input rolls back pending changes. In contrast, **dbcon --db ./work.db -w --update ...** is a one-shot action that saves automatically on success.
 
 # CONFIGURATION
 ## --set-config — configuration wizard
@@ -267,12 +491,12 @@ Used alone. Selects or creates a configuration and saves its path in **conf/sett
 
 An existing valid configuration is selected without overwriting it. An invalid configuration prompts for replacement.
 
-**Database settings.** When creating a configuration, supply the path to an existing database, then **readOnly** and **busyTimeoutMilliseconds**. Enter keeps the displayed default. An empty or invalid database path stops the wizard without creating files. A relative database path starts from the JSON directory.
+**Database settings.** When creating a configuration, supply the path to an existing database and the requested connection settings. Enter keeps the displayed defaults. The saved configuration does not replace the explicit **-w** required for writing. An empty or invalid database path stops the wizard without creating files. A relative database path starts from the JSON directory.
 
 ## JSON format
 
 **databasePath** — required path to an existing database; **~** expands, and relative paths start from the configuration directory.
-**readOnly** — default access mode.
+**readOnly** — boolean retained for configuration compatibility; writing still requires explicit **-w** at startup.
 **busyTimeoutMilliseconds** — wait for a busy database in milliseconds, minimum **1000**.
 
   {
@@ -295,6 +519,18 @@ Without **--db** or **--config**, dbcon uses the path in **conf/settings.ini**, 
 
 If the binary is inside **bin**, **conf** is a sibling of **bin**; otherwise, it is beside the binary.
 
+## SQLite WAL files and copying a live database
+
+In WAL mode, SQLite can create **work.db-wal** and **work.db-shm** beside **work.db**. WAL stores changed pages and commit records; SHM is an index and coordination file. They are SQLite service files, not additional databases selected by dbcon. WAL mode is persistent in the database, so a copied database can retain it. A zero-byte WAL alone is not an error.
+
+Read-only access prevents logical data writes, but SQLite can still need to create or access WAL/SHM service files. Do not delete them manually while the database is in use. A live WAL may contain committed data not yet copied into the main file; copying only the main file with cp is not a reliable live backup.
+
+Use SQLite's backup operation to create a consistent copy. The following command requires the sqlite3 CLI and refuses to overwrite an existing target:
+
+  test ! -e ./work-copy.db && sqlite3 -readonly ./work.db ".backup './work-copy.db'"
+
+Then open the copy with **dbcon --db ./work-copy.db**. Do not use immutable mode as a workaround for a database that another process can change. Reference: https://www.sqlite.org/wal.html
+
 # HELP
 **-h / --help** prints a short summary without opening the database. **--man [en|ru]** prints the full manual; English is used if no language is specified. Both actions must be used alone.
 
@@ -306,7 +542,7 @@ If the binary is inside **bin**, **conf** is a sibling of **bin**; otherwise, it
 
 # dbcon
 
-Просмотр структуры, чтение, поиск и подсчёт записей SQLite.
+Просмотр структуры, чтение, поиск, подсчёт и изменение записей SQLite. В оболочке доступны SQL SQLite и флаги.
 
 ## Синтаксис
 
@@ -332,13 +568,13 @@ If the binary is inside **bin**, **conf** is a sibling of **bin**; otherwise, it
   dbcon --config ./temporary.json --tables
   dbcon --config ./config.json --db ./other.db --tables
 
-**Приоритет.** Явные **--db**, **-r / -w** и **--timeout** заменяют соответствующие значения конфигурации. **--db** без **--config** игнорирует сохранённую конфигурацию. Выбор конфигурации без этих параметров описан в разделе «Конфигурация».
+**Приоритет.** Явные **--db** и **--timeout** заменяют соответствующие значения конфигурации. Для записи нужен флаг запуска **-w**, независимо от сохранённого **readOnly**. **--db** без **--config** игнорирует сохранённую конфигурацию. Выбор конфигурации без этих параметров описан в разделе «Конфигурация».
 
 ## -r / -w — режим доступа
 
 **-r** запрещает изменения базы. **-w** открывает соединение с правом чтения и записи. Укажите один из этих флагов, чтобы выбрать режим на текущий запуск; вместе они вызывают ошибку.
 
-Если ни один флаг не указан, режим берётся из конфигурации: **readOnly: true** — только чтение, **readOnly: false** — чтение и запись. Если конфигурация не используется, база открывается только для чтения.
+Если ни один флаг не указан, CLI/shell открывает базу только для чтения. Старая конфигурация с **readOnly: false** не разрешает запись: укажите **-w** явно. Чтение доступно в обоих режимах. Для MCP обязателен явный **-r** или **-w**.
 
 ## --timeout <мс> — ожидание занятой базы
 
@@ -433,7 +669,7 @@ If the binary is inside **bin**, **conf** is a sibling of **bin**; otherwise, it
   dbcon -t part --where 'time_created >= 1794400000000' --where 'time_created < 1794410800000' --order-by time_created -c time_created,'data:$.text' -n 20
   dbcon --count -t records --where 'status = ready OR title IS NULL'
 
-**Совместимость:** требует таблицу. Сочетается с чтением, поиском и подсчётом. Не сочетается с просмотром структуры. Вместе с поиском должны совпасть и поиск, и фильтр.
+**Совместимость:** требует таблицу. Сочетается с чтением, поиском, подсчётом, обновлением и удалением. Не сочетается с просмотром структуры и вставкой. Вместе с поиском должны совпасть и поиск, и фильтр.
 
 ## --order-by, --sort — сортировка строк
 
@@ -472,14 +708,81 @@ If the binary is inside **bin**, **conf** is a sibling of **bin**; otherwise, it
 
 **Совместимость:** не сочетается с **--read**, **--columns**, **-n** или **-f**. Выбор полей через **-c** требует поиска или **-p**. При сочетании поиска и **-p** должны выполняться обе проверки.
 
+## --insert, -I — вставка записей
+
+**Синтаксис:** --insert -t <таблица> [-c <колонки>] --values <SQL-выражения>
+
+Требует **-w** и ровно одну таблицу по буквальному имени. Колонки выбираются через **--column / -c**; для пропущенных колонок SQLite использует значения по умолчанию. Без **-c** значения следуют порядку колонок SQLite. **-I** — заглавная; строчная **-i** остаётся поиском без учёта регистра.
+
+**--values** задаёт список SQL-значений или выражений через запятую. Строки заключаются в одинарные SQL-кавычки, кавычка внутри строки удваивается, числа пишутся без кавычек, **NULL** означает SQL NULL. Внешние двойные кавычки в примерах защищают аргумент в терминале или оболочке dbcon; они не заменяют внутренние SQL-кавычки.
+
+  dbcon --db ./work.db -w --insert -t users -c id,name,age --values "1,'Vasya',30"
+  dbcon --db ./work.db -w -I -t users -c id,name,age --values "2,'O''Brien',NULL"
+
+## --update, -u — обновление записей
+
+**Синтаксис:** --update -t <таблица> --set <SQL-присваивания> [--where <фильтр> ...]
+
+Требует **-w** и ровно одну таблицу. **--set** задаёт SQL-присваивания, включая выражения со значениями текущей строки. **--where** использует описанный выше проверяемый язык фильтров; повторные фильтры соединяются И. **Без --where обновляются все строки таблицы**, как в SQL без WHERE.
+
+  dbcon --db ./work.db -w --update -t users --set "name='Vasya',age=31" --where "id=1"
+  dbcon --db ./work.db -w -u -t users --set "age=age+1" --where "id=2"
+
+## --delete — удаление записей
+
+**Синтаксис:** --delete -t <таблица> [--where <фильтр> ...]
+
+Требует **-w** и ровно одну таблицу. Короткого алиаса нет. **Без --where удаляются все строки таблицы.** Сама таблица остаётся.
+
+  dbcon --db ./work.db -w --delete -t users --where "id=2"
+
+**Совместимость записи.** Выберите одно действие записи. Оно не сочетается с чтением, поиском, подсчётом, сортировкой, **-n** и **-f**. **--values** относится к вставке, **--set** — к обновлению. Обновление и удаление не принимают **-c**. Звёздочка вместо таблицы не допускается. JSON-пути как цели записи этими флагами не поддерживаются; для изменения JSON используйте SQL-функции SQLite в оболочке.
+
+**Сохранение.** Разовая CLI-команда записи автоматически сохраняется при успехе. При ошибке она откатывается и возвращает ненулевой код завершения. Те же флаги работают в оболочке, но изменения ожидают **SAVE** или SQL **COMMIT**. **CANCEL** откатывает накопленную транзакцию. SAVE/CANCEL — команды оболочки, не флаги CLI.
+
+**SQL-входы.** **--set**, **--values** и прямой SQL оболочки намеренно принимают SQL, а не только буквальные данные. Не подставляйте в них непроверенный внешний текст. Значения **--where** остаются параметрами. Флаги записи формируют одну SQL-инструкцию; прямой SQL оболочки принимает пакеты.
+
+## --find — ранжированный поиск эпизодов (CLI и shell)
+
+**Синтаксис:** --find -t <таблица> --key <колонки> -c <текстовые поля> [-s <текст>] [--require 'a|b'] [параметры]
+
+Прежний **-s/--search**, включая field=value, сохраняет поведение без новых параметров. **--find** явно выбирает новое ядро; новые параметры, например --key, также включают его. В новом режиме -s — буквальный текст, не field=value. Обязательны одна таблица и явные текстовые/ключевые поля. Нет понимания естественного языка, угаданных синонимов, сохранённых профилей, новых файлов/таблиц/индексов и записи. Ключ проверяется на уникальность и отсутствие NULL по всей таблице; составные ключи и WITHOUT ROWID поддерживаются. CLI/shell и MCP используют одно ядро.
+
+- Повторные **-s** — обязательные условия; **--mode any** объединяет их как альтернативы. По умолчанию all. **--require 'a|b'** добавляет обязательную группу альтернатив, повторяется для И. Буквальный | можно передать через -s, не внутри альтернатив --require. **--phrase <текст>** добавляет обязательную фразу. Не больше 32 условий и 32 альтернатив в группе. **--exclude <текст>** исключает совпавшую строку и разрывает эпизод, чтобы признаки не соединялись через неё. Повторяемые тексты/фразы не разбиваются по пробелам или запятым.
+- **--match substring|word|phrase|whole** (по умолчанию substring): подстрока, текст с границами слов, фраза с границами или всё нормализованное значение. Word и phrase требуют границы; элемент из нескольких слов остаётся одной буквальной последовательностью. --phrase всегда ищет фразу с границами. **-i** отключает учёт регистра; по умолчанию регистр учитывается. **-e/-ie** выбирают целое значение, опционально без регистра. Используется каноническая композиция Unicode и свёртывание последовательностей пробелов; **--literal-space** отключает свёртывание, **--fold-yo** включает равенство ё/е. Исправления опечаток, стемминга, транслитерации и загрузки моделей нет.
+- **-c** принимает обычные колонки/JSON-пути и один [*] на селектор, например 'data:$.content[*].text'. После [*] поддерживаются шаги .имя и [неотрицательный индекс]. **--element-type text** ограничивает элементы массива по точному типу, повторяется для альтернатив. **--element-type-field <имя>** выбирает свойство типа, по умолчанию type. Без типов допускаются все элементы. Ищутся только строки; отсутствующий/невалидный JSON и значения других типов текста не добавляют. Выдача указывает фактический индекс массива. Общие SQL-фильтры --where и прежний -s поддержку [*] не получают.
+- **--where** фильтрует исходные строки прежней ограниченной грамматикой; автора, время и область задавайте явно. **--group-by <поля> --window <1..50> --order-by <поля>** разрешают условиям находиться в разных соседних содержательных строках одной точной группы. По умолчанию window 1. Группа с NULL строки не объединяет. Строки без выбранного текста не считаются. Обход: поля группы по возрастанию, затем выбранный порядок и ключи; физическое положение не используется. **--max-gap <секунды>** дополнительно разрывает окно по промежутку между соседними метками времени: нужны числовой --time-column и --time-unit seconds/milliseconds; диапазон 1..604800, без параметра временного предела нет. Ограничение числа строк само по себе не ограничивает время.
+- Ранжирование учитывает лучшее доказательство один раз на условие, не частоту повторения: 1000 за условие плюс подстрока 100/границы 140/целое значение +60/фраза +100. **--priority <поля>** удваивает качество в этих поисковых селекторах. Короткий диапазон содержательных строк добавляет до 100 баллов; однострочный эпизод получает до 100 на поле за близость выбранных первых совпадений. В каждом окне рассматривается кратчайший суффикс, выполняющий условия. По умолчанию выбирается один лучший эпизод группы; при разрешении нескольких окна могут пересекаться. В целые разговоры эпизоды не сливаются. **--rank relevance|fields** выбирает балл или порядок обхода; fields требует --order-by. Равенство разрешается порядком обхода. Баллы не являются вероятностью правильного ответа.
+- **--meta <поля>** добавляет исходные метаданные. **--time-column <поле> --time-unit seconds|milliseconds|iso8601 [--time-zone UTC]** явно форматирует время с сохранением исходного значения. Часовой пояс — IANA-идентификатор; ISO-текст требует T и Z/смещение. Неверное время подходящей содержательной строки — ошибка; NULL форматируется как null. Фильтры и порядок работают по исходным значениям. В --key/--group-by/--priority/--meta имена разделяются запятыми; имена с пробелами заключайте в кавычки.
+- **-n 10** (1..100) ограничивает эпизоды; **--offset 0** (0..10000) задаёт страницу. **--snippet 240** (16..4000) ограничивает выдержку поля в Swift Character, не байтах/токенах. Исходные смещения start/end — с нуля, end не включается. Выдержка может не показать остальные совпадения; их пути/смещения есть в доказательствах. **--max-bytes 16000** (1024..1000000) ограничивает структурированный результат с метаданными, не точный размер человеческого форматирования и не обёртку MCP. Сокращение и продолжение обозначаются явно; слишком большой первый кандидат или точные метаданные вызывают ошибку. Предел позиции выше 10000 требует сузить фильтры. Один вызов использует транзакцию чтения, но снимок между страницами не сохраняется.
+- По умолчанию вывод человеческий; **-f** сокращает отображаемые выдержки до 120 Character, **--json** возвращает структуру данных. Терминальные управляющие символы в человеческом тексте экранируются. Результаты содержат ключи, группу, балл, доказательства и совпавшие сообщения, а не целые разговоры. Релевантность определяется явными условиями, не угадыванием намерения.
+
+Пример для records(id, conversation_id, created, body):
+
+**--per-group 1** (0..100) по умолчанию возвращает не больше одного лучшего эпизода явной группы; 0 снимает предел. Независимые эпизоды не объединяются. Без group-by каждая строка — отдельная группа. Предел применяется до пагинации.
+
+  dbcon --db ./work.db --find -t records --key id -c body --require 'txt' --require 'чат|истори' -i --group-by conversation_id --window 4 --order-by 'created ASC' -n 5
+
+## --context — оригиналы и соседний текст
+
+**Синтаксис:** --context -t <таблица> --key <колонки> -c <текстовые поля> --anchor <фильтр> --order-by <поля> [--where <область>] [--before 2] [--after 2] [--full]
+
+--anchor повторяется через И и должен выбрать ровно одну строку внутри --where. --where ограничивает и соседей: задавайте область явно, чтобы не перейти границы разговора. Before/after — 0..50 содержательных строк в выбранном порядке, не обязательно более раннее/позднее время; по умолчанию 2 с каждой стороны. Технические строки без выбранного текста, включая элементы исключённых типов, не считаются. --full возвращает выбранный исходный текст полностью; без него поля сокращаются от начала. Общий бюджет всё равно действует. Ключи сохраняются. Селекторы массива в -c, --element-type, --meta, форматирование времени, -n, --offset, --snippet, --max-bytes, -f и --json работают как выше.
+
+Для связи равенства между таблицами добавьте **--source-table <таблица> --source-field <поле> --related-field <поле>**. Исходная таблица по умолчанию равна целевой. --anchor тогда выбирает одну исходную строку независимо от целевого --where; ключевые колонки относятся к целевой таблице. NULL связи запрещён. --before/--after в режиме связи не принимаются. Это одна явная связь, не произвольный JOIN и не автоматический обход.
+
+  dbcon --db ./work.db --context -t records --key id -c body --anchor 'id = 42' --where "conversation_id = 'example'" --order-by 'created ASC' --before 2 --after 0 --full
+
+В shell используйте те же флаги без --db и других стартовых параметров, затем GO. Прежние SQL и команды с флагами не меняются.
+
 ## --mcp — локальный MCP-сервер
-**Синтаксис:** dbcon --mcp [--db <файл> | --config <файл>] [--timeout <мс>] [-r]
+**Синтаксис:** dbcon --mcp (-r | -w) [--db <файл> | --config <файл>] [--timeout <мс>]
 
-Запускает MCP-сервер только для чтения через стандартные потоки ввода/вывода, без сетевого порта. Использует протокол **2025-06-18** и обычные правила выбора конфигурации. Соединение всегда открывается только для чтения, даже при **readOnly: false** в конфигурации. **-w**, другие действия и флаги запросов не сочетаются с **--mcp**; параметры запросов передаются через инструменты.
+Запускает MCP-сервер через стандартные потоки ввода/вывода, без сетевого порта. Использует протокол **2025-06-18** и обычные правила выбора конфигурации. Обязателен ровно один явный флаг: **-r** — чтение, **-w** — чтение и запись; конфигурация этот выбор не заменяет. Запуск просто **--mcp** — ошибка. Другие действия и флаги запросов не сочетаются с **--mcp**; параметры передаются через инструменты. В режиме чтения инструменты записи не публикуются, прямой вызов отклоняется, SQLite открывается только для чтения. Это не ограничивает другие программы и обычный CLI, доступные агенту через терминал.
 
-  dbcon --mcp
-  dbcon --mcp --db ~/data/work.db
-  dbcon --mcp --config ./config.json
+  dbcon --mcp -r
+  dbcon --mcp -r --db ~/data/work.db
+  dbcon --mcp -w --config ./config.json
 
 MCP-клиент запускает эту команду отдельным процессом. stdin принимает по одному JSON-RPC-сообщению на строку; stdout содержит только ответы протокола. Ошибки запуска отправляются в stderr. Конец ввода завершает сервер. До запроса списка инструментов и их вызова клиент отправляет **initialize**, затем **notifications/initialized**.
 
@@ -488,18 +791,119 @@ MCP-клиент запускает эту команду отдельным п�
 **describe_table** — обязательный **table**; возвращает колонки и определение таблицы.
 **read_rows** — обязательный **table**; необязательные **columns**, **search**, **where**, **order_by**, **ignore_case**, **exact**, **limit**.
 **count_rows** — обязательный **table**; необязательные **columns**, **search**, **where**, **ignore_case**, **exact**, **non_empty**.
+**search_rows** — ранжированные выдержки с ограничением объёма; отдельный раздел ниже.
+**read_context** — ограниченное окружение или явно связанные строки; описание ниже.
 
-Один вызов выбирает одну таблицу по буквальному имени. **columns**, **search**, **where** и **order_by** — массивы строк. Имена в массивах не разбиваются по пробелам; **order_by** также принимает поля через запятую. **columns** по умолчанию выбирает все поля. **search** соответствует **-s**, **where** — **--where**, **order_by** — **--sort**. Условия из **search** и **where** соединяются И. **ignore_case** и **exact** — логические значения, требующие непустого поиска. **non_empty** соответствует **-p**; выбор колонок при подсчёте требует **non_empty** или поиска.
+Один вызов чтения/подсчёта выбирает одну таблицу по буквальному имени. **columns**, **search**, **where** и **order_by** — массивы строк. Имена в массивах не разбиваются по пробелам; **order_by** также принимает поля через запятую. **columns** по умолчанию выбирает все поля. **search** соответствует **-s**, **where** — **--where**, **order_by** — **--sort**. Условия из **search** и **where** соединяются И. **ignore_case** и **exact** — логические значения, требующие непустого поиска. **non_empty** соответствует **-p**; выбор колонок при подсчёте требует **non_empty** или поиска.
 
 **limit** — положительное целое число, по умолчанию **100**, только для **read_rows**. Результат содержит **row_count**, **limit** и **limit_reached**. Достигнутый лимит означает, что строки могут продолжаться, но не гарантирует следующую строку. Для следующей порции используйте **where** и однозначный **order_by**, добавляя уникальное поле при одинаковом времени.
 
-Результат инструмента содержит JSON в **structuredContent** и в текстовом блоке. Текст возвращается полностью, временные метки не преобразуются. SQL NULL становится JSON null; целые и конечные дробные значения — JSON-числами. BLOB передаётся как **{"type":"blob","hex":"..."}**, неконечное число — как **{"type":"real","value":"..."}**. Объекты и массивы JSON-путей остаются JSON-текстом, возвращённым SQLite. Обработка больших целых зависит от клиента.
+Результат инструмента содержит JSON в **structuredContent** и в текстовом блоке. В **read_rows** текст возвращается полностью, временные метки не преобразуются. **search_rows/read_context** возвращают явные выдержки и необязательное форматирование объявленного поля времени. SQL NULL становится JSON null; целые и конечные дробные значения — JSON-числами. BLOB передаётся как **{"type":"blob","hex":"..."}**, неконечное число — как **{"type":"real","value":"..."}**. Объекты и массивы JSON-путей остаются JSON-текстом, возвращённым SQLite. Обработка больших целых зависит от клиента.
 
 Пример params для **tools/call**:
 
   {"name":"read_rows","arguments":{"table":"records","columns":["id","title"],"search":["status=ready"],"exact":true,"order_by":["id ASC"],"limit":10}}
 
 Неизвестный инструмент или неверный формат аргументов возвращает ошибку JSON-RPC. Ошибка запроса возвращает результат инструмента с **isError: true**; сервер продолжает принимать запросы.
+
+### search_rows — ранжированные выдержки (1.1.0)
+
+Инструмент только читает: не меняет **read_rows**, не создаёт индексов/таблиц/файлов, не загружает словари или модели. Сканирует строки после фильтрации; ускорение не входит в эту возможность. Проверка ключей и сортировка могут быть дорогими. Один вызов использует одну транзакцию чтения; долгий вызов может удерживать снимок WAL. Доступен и в **-r**, и в **-w**.
+
+Обязательны **table**, **key_columns**, **search_columns** и хотя бы одно условие **search**, **required_groups** или **phrases**. Семантика совпадает с CLI --find выше, включая явные уникальные ключи без NULL. **search_columns** допускает обычные поля и один [*]; **element_types/element_type_field** фильтруют типы элементов. Поля метаданных/группы/времени [*] не принимают. Скрытого rowid, предполагаемой схемы приложения и автоматических границ разговоров нет.
+
+**search** — буквальные элементы, не field=value. **mode: all|any** объединяет их; **required_groups** содержит обязательные группы альтернатив через |; **phrases** добавляет обязательные фразы. **exclude** исключает строку и разрывает эпизод. **group_by**, **window_rows** и **order_by** разрешают условиям находиться в соседних строках ограниченной явной группы; **max_gap_seconds** опционально ограничивает разрыв по числовому времени. Без window_rows окно равно 1, без max_gap_seconds временного предела нет.
+
+**match: substring|word|phrase|whole** соответствует CLI --match. По умолчанию **ignore_case false**, **normalize_space true**, **fold_yo false**. where/order_by сохраняют исходную семантику SQLite. Выдержки сохраняют оригинал; синонимы и приближённые совпадения не выводятся автоматически.
+
+**priority_columns** удваивает качество в выбранных поисковых селекторах. **sort: relevance** (по умолчанию) или **fields** соответствует CLI --rank. Балл учитывает лучшее доказательство один раз на условие и близость, описанные выше, не частоту повторения. В обходе и разрешении равенства поля группы предшествуют order_by/ключам. Понимания смысла и вероятности правильного ответа нет.
+
+Результаты — локальные кандидаты, выбранные через **per_group** (по умолчанию 1, 0..100, 0 снимает предел). Несколько эпизодов могут пересекаться; в целые разговоры они не сливаются. Каждый содержит **key**, **end_key**, **group**, **score**, **span_rows**, **evidence**, **messages**. Доказательство указывает условие/запрос, точный ключ, конкретный путь, метод, исходные смещения и качество. Сообщения содержат ключи, выдержки и необязательные метаданные/время. **scanned_rows** считает строки после SQL-фильтра; **eligible_rows** — строки с выбранным текстом; **matching_source_rows** — неисключённые строки с любым положительным совпадением; **matched_windows** — подходящие рассмотренные окна до отбора по группе/общему лимиту, не итоговых уникальных кандидатов.
+
+**metadata_columns** возвращает явно выбранные значения полностью; по умолчанию ничего. **time_column** требует **time_unit: seconds | milliseconds | iso8601**; **time_zone** по умолчанию **UTC**, принимает IANA-идентификатор. Для числовых единиц нужны числовые значения. ISO-8601-текст должен содержать T и Z/явное смещение. NULL даёт null при форматировании; неверное время совпавшей строки вызывает ошибку, а не угадывание. **time** содержит field, raw, formatted и time_zone. where/order_by по-прежнему работают с исходным значением.
+
+Значения по умолчанию/диапазоны: **limit 10 (1..100)**, **offset 0 (0..10000)**, **window_rows 1 (1..50)**, **snippet_chars 240 (16..4000)**, **max_bytes 16000 (1024..1000000)**. В строковых массивах до 32 различных элементов. Выдержки указывают исходные смещения Swift Character с нуля без включения end и признаки truncated_before/truncated_after. **position** — место с единицы в данном запросе, не постоянный номер записи. Выдержка может не показывать другие доказательства; при необходимости читайте оригинал.
+
+**max_bytes** ограничивает структуру результата, не токены или обёртку MCP. **budget_reached**, **has_more**, **next_offset**, **offset_limit_reached** явно задают продолжение по тем же правилам, что CLI. Слишком большие первые кандидаты/точные метаданные вызывают ошибку. Следующая страница выполняет запрос заново; параллельные изменения могут сдвигать страницы. Между вызовами снимок не сохраняется.
+
+Пример params tools/call для таблицы **records(id, body, conversation_id, created)**:
+
+  {"name":"search_rows","arguments":{"table":"records","key_columns":["id"],"search_columns":["body"],"search":["car","automobile"],"mode":"any","ignore_case":true,"group_by":["conversation_id"],"order_by":["created DESC"],"time_column":"created","time_unit":"milliseconds","limit":5,"max_bytes":8000}}
+
+### read_context — ограниченный контекст (1.1.0)
+
+Обязательны **table**, **key_columns**, **anchor_where**, **text_columns**. Это то же ядро, что CLI --context. **text_columns** поддерживает [*] с **element_types/element_type_field**. Соседями считаются только строки с выбранным строковым текстом. **full: true** возвращает выбранный оригинал в пределах max_bytes; иначе snippet_chars сокращает от начала. Неоднозначная/отсутствующая опорная запись и опорная запись без выбранного текста — ошибки. Остальные параметры, явные связи и пагинация соответствуют CLI выше. Для произвольных полных типизированных полей используйте read_rows.
+
+Режим соседей требует **order_by**. **where** ограничивает и опорную запись, и соседей (например, одним разговором); **anchor_where** добавляет точный ключ. По умолчанию **before 2**, **after 2**, каждый **0..50**. Опорная строка включена с **relative_position: 0**; отрицательные/положительные значения — строки до/после неё в выбранном порядке, не обязательно более раннее/позднее время. Ключевые колонки разрешают равенство порядка. Границы разговоров инструмент не угадывает.
+
+Режим связи требует **source_field** и **related_field** вместе; **source_table** по умолчанию равна table. **anchor_where** выбирает одну исходную строку независимо от целевого **where**. related_field целевой таблицы сравнивается со скалярным source_field через равенство SQLite. NULL источника запрещён. key_columns относятся к целевой таблице; before/after в этом режиме не принимаются. Поддерживается одна явная связь, не произвольные JOIN и не рекурсивный обход графа.
+
+Оба режима используют **limit 10 (1..100)** и **offset 0 (0..10000)** внутри выбранного окна/связи; возвращают results, row_count, has_more, next_offset и budget_reached. Между страницами снимок не сохраняется. Каждый результат содержит точный key, позицию в выбранном контексте, сокращённые поля и необязательные метаданные/время.
+
+  {"name":"read_context","arguments":{"table":"records","key_columns":["id"],"anchor_where":["id = 42"],"where":["conversation_id = 'example'"],"text_columns":["body"],"order_by":["created ASC"],"before":2,"after":3,"snippet_chars":1000}}
+  {"name":"read_context","arguments":{"table":"records","key_columns":["id"],"source_table":"conversations","anchor_where":["id = 'example'"],"source_field":"id","related_field":"conversation_id","text_columns":["body"],"order_by":["created ASC"],"limit":10}}
+
+**Инструменты записи (только -w; новые в 1.1.0):**
+**insert_rows** — обязательны **table**, **values**; необязательны **columns**, **returning**. **values** — непустой массив списков SQL-выражений: одна строка на запись, без внешних скобок. **columns** перечисляет существующие буквальные имена колонок; без него используется порядок колонок таблицы. Текст заключайте в одинарные SQL-кавычки, внутреннюю одинарную кавычку удваивайте. SQL NULL записывается как **NULL**, не JSON null.
+**update_rows** — обязательны **table**, **set** и либо непустой **where**, либо **all_rows: true**. **set** — один список SQL-присваиваний, как CLI **--set**.
+**delete_rows** — обязательны **table** и либо непустой **where**, либо **all_rows: true**.
+**write_batch** — обязательный непустой массив **operations**. Каждый объект содержит **action** (insert/update/delete), **table** и аргументы соответствующего инструмента записи, без его имени. Операции могут обращаться к разным таблицам выбранной базы. Лишние и неподходящие действию аргументы отклоняются.
+
+**where** использует ограниченный синтаксис фильтров чтения. **all_rows** и непустой **where** взаимоисключающие. Пустые массивы values/columns/returning отклоняются. Колонки записи/возврата — буквальные имена, не JSON-пути и не '*'. Выражения **values** и **set** требуют такой же осторожности, как CLI: нельзя подставлять недоверенный текст без SQL-экранирования. Одна операция принимает одну SQL-инструкцию, не пакет через точку с запятой. Пользовательские команды транзакций, изменение схемы, ATTACH/DETACH и PRAGMA не предоставлены отдельными MCP-инструментами.
+
+Каждый вызов записи открывает одну транзакцию и автоматически сохраняет её только после успеха всех операций. Ошибка подготовки, исполнения или сохранения откатывает весь вызов, включая предыдущие операции. SAVE/CANCEL нет; незавершённая транзакция между вызовами не переносится. Первая ошибка останавливает пакет. Потеря соединения после сохранения может потерять ответ, но не изменения: перед повторением неидемпотентной записи проверьте базу.
+
+Успех содержит **committed: true**, **operation_count** и **operations**. Для каждой операции возвращаются её номер **operation** с единицы, **action**, **table**, **rows_changed** (счётчик непосредственных изменений SQLite) и **rows_changed_including_triggers** (разность общего счётчика изменений SQLite). Это число изменений по правилам SQLite, не обязательно число действительно отличающихся значений; учитывайте особенности триггеров, представлений и внешних ключей. Изменённые данные по умолчанию не повторяются. Необязательный **returning** запрашивает буквальные колонки через SQLite RETURNING и добавляет **returned_rows** с теми же типами, что при чтении. Выборка может быть большой, скрытого лимита нет. RETURNING требует SQLite 3.35.0+ и сохраняет её ограничения, включая значения до последующих изменений AFTER-триггерами. Созданные идентификаторы получают запросом их колонок, а не угадывают по общему last-insert ID.
+
+Ошибка содержит **isError: true**, номер неудачной операции с единицы, исходное сообщение и подтверждение полного отката. Номер **0** означает, что транзакцию не удалось начать. Ошибка сохранения относится к последней операции. Если сам откат завершился ошибкой, ответ сообщает об этом, не утверждая успех; MCP-соединение закрывается.
+
+Примеры для существующей таблицы **users(id, name, age)** (используйте тестовую копию):
+
+  {"name":"insert_rows","arguments":{"table":"users","columns":["id","name","age"],"values":["101, 'Alice', 35","102, 'O''Brien', 40"],"returning":["id"]}}
+  {"name":"write_batch","arguments":{"operations":[{"action":"update","table":"users","set":"age = age + 1","where":["id = 101"]},{"action":"delete","table":"users","where":["id = 102"]}]}}
+
+## Подключение к OpenCode
+
+Ниже — конфигурация OpenCode V2; в старом формате V1 имена серверов размещались непосредственно внутри **mcp**. Сохраните остальные настройки и исправляйте существующее подключение вместо добавления дубликата. Новые аргументы dbcon требуют **-r** или **-w**, в том числе для подключений, созданных с dbcon 1.0.0.
+
+1. Установите dbcon в **~/.local/bin/dbcon** по инструкции установки в README. При другом месте установки замените путь к программе ниже. Используйте новую сборку, не старый установленный бинарник. Стандартная база OpenCode — **~/.local/share/opencode/opencode.db**; переменная **OPENCODE_DB** может менять её расположение. Подключение к истории оставьте только для чтения, запись проверяйте на отдельной копии.
+2. Откройте глобальный конфиг **~/.config/opencode/opencode.jsonc** (либо существующий **opencode.json**). Добавьте **dbcon** внутрь **mcp.servers**; отсутствующие объекты добавьте. Ниже полный минимальный конфиг, не команда замены существующего файла:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "dbcon": {
+        "type": "local",
+        "command": [
+          "{env:HOME}/.local/bin/dbcon",
+          "--mcp",
+          "-r",
+          "--db",
+          "{env:HOME}/.local/share/opencode/opencode.db"
+        ]
+      }
+    }
+  }
+}
+```
+
+Каждый аргумент — отдельная JSON-строка. OpenCode заменяет **{env:HOME}** значением переменной HOME; обычный **$HOME** внутри JSON-строк не раскрывается. Между соседними полями существующего файла нужны запятые. **--db** явно задаёт базу, поэтому подключение не зависит от сохранённого конфига dbcon или рабочей папки клиента. Если OpenCode использует нестандартную базу, замените путь к ней фактическим.
+
+3. Вместо ручного редактирования можно добавить то же подключение командой OpenCode (не выполняйте оба варианта):
+
+  opencode mcp add dbcon --global -- "$HOME/.local/bin/dbcon" --mcp -r --db "$HOME/.local/share/opencode/opencode.db"
+
+4. Сохраните и проверьте:
+
+  opencode mcp list
+
+OpenCode сам запускает dbcon и предоставляет инструменты; отдельный терминал с dbcon держать не нужно. V2 автоматически перечитывает конфиг; при необходимости используйте **/reload**. Статус подключения виден через **/mcps**. Попросите: «Через dbcon покажи таблицы и структуру таблицы session». В **-r** исходники 1.1.0 предоставляют шесть инструментов чтения и ни одного записи (опубликованная 1.0.0 — четыре).
+
+5. Для записи замените строку **-r** на **-w**, укажите тестовую базу через **--db** и переподключите MCP-сервер, чтобы процесс запустился с новыми аргументами. Должны появиться четыре дополнительных инструмента записи. Не проверяйте запись на рабочей истории OpenCode. Обычный **dbcon -w** в терминале независим от этого MCP-подключения.
+
+Документация: https://opencode.ai/docs/mcp-servers
 
 # ОБЩИЕ ПРАВИЛА
 
@@ -540,10 +944,14 @@ MCP-клиент запускает эту команду отдельным п�
 
 Без действия программа открывает оболочку с выбранной базой. Приглашение **read-only:>>** обозначает режим чтения, **write:>>** — режим чтения и записи.
 
+Приглашение появляется перед новой командой, а не перед каждой строкой многострочного ввода. При вводе через трубу приглашения отсутствуют; правила транзакций оболочки сохраняются.
+
   dbcon
   dbcon --db ./work.db -r
 
-Команда накапливается до **GO**: на отдельной строке или в конце строки через пробел. Перед GO допускается **;**. Регистр команд не учитывается. Аргументы с пробелами заключайте в одинарные или двойные кавычки.
+Команда накапливается до **GO**: на отдельной строке или в конце строки через пробел. Регистр SQL-слов и команд оболочки не учитывается; флаги сохраняют регистр (**-I** отличается от **-i**). Аргументы флагов с пробелами заключайте в одинарные или двойные кавычки. Прямой SQL использует правила кавычек SQLite.
+
+**Точка с запятой.** Разделяйте SQL-инструкции в пакете символом **;**. После последней инструкции перед GO он необязателен. GO запускает выполнение; одна точка с запятой — нет. Точки с запятой и GO внутри SQL-строк являются данными, а не разделителями команд.
 
 GO внутри кавычек является частью аргумента. Команду и её флаги можно вводить на нескольких строках. Параметры подключения (**--db**, **--config**, **-r / -w**, **--timeout**) задаются при запуске; внутри оболочки они вызывают ошибку.
 
@@ -564,11 +972,63 @@ GO внутри кавычек является частью аргумента.
   COUNT records -p -c 'data:$.text'; GO
   -s session_id=sample_001 -s 'data:$.type=text' -e -t part -c 'data:$.text' -n 20; GO
 
-Форма **SELECT поля FROM таблица LIMIT число** поддерживает чтение списка полей одной таблицы; это не произвольный SQL-запрос.
+**SQL и флаги.** SQL передаётся SQLite напрямую, без перевода во флаги. Прежняя форма **SELECT -t ...** также сохранена. Для SQL-инструкций используется SQL-синтаксис, для команд с флагами — синтаксис флагов; GO выполняет оба варианта.
+
+  SELECT id, name, age FROM users WHERE age >= 18 ORDER BY id LIMIT 10;
+  GO
+
+## Запись, транзакции и точки сохранения
+
+Запустите **dbcon --db ./work.db -w**. Обычные операции записи автоматически начинают транзакцию, если она ещё не открыта. SQL и флаги записи работают в общей транзакции.
+
+  UPDATE users SET age = 31 WHERE id = 1;
+  UPDATE users SET age = 40 WHERE id = 2;
+  GO
+  SAVE
+
+**SAVE / save** сохраняет накопленные изменения. **CANCEL / cancel** откатывает их. Обе команды также выполняются отдельно, без GO. После сохранения или отмены следующая обычная запись начинает новую транзакцию. SQL-команды **BEGIN**, **COMMIT**, **ROLLBACK**, **SAVEPOINT**, **ROLLBACK TO** и **RELEASE** обрабатываются SQLite через GO.
+
+  BEGIN;
+  UPDATE users SET age = 31 WHERE id = 1;
+  SAVEPOINT second_change;
+  UPDATE users SET age = 99 WHERE id = 2;
+  ROLLBACK TO second_change;
+  RELEASE second_change;
+  COMMIT;
+  GO
+
+Здесь первое обновление сохраняется, второе отменяется. SQL-команды транзакций сохраняют смысл SQLite: освобождение внешней SAVEPOINT, которая сама открыла транзакцию, сохраняет её. SAVE/CANCEL — удобные команды, не замена SQL-транзакциям.
+
+Пакет останавливается на первой ошибке; последующие инструкции не выполняются. Ранее успешно выполненные изменения могут оставаться несохранёнными. Проверьте их и осознанно выберите SAVE или CANCEL. Синтаксические ошибки и нарушения SQL-ограничений сообщает SQLite; dbcon не угадывает исправления запроса.
+
+## PRAGMA и выбор базы
+
+PRAGMA доступны как SQL в оболочке, без флагов-алиасов. В режиме чтения допускаются диагностические PRAGMA; настройки и другие служебные операции требуют **-w**. В режиме записи PRAGMA выполняются по собственным правилам SQLite.
+
+  PRAGMA table_info(users);
+  GO
+
+  PRAGMA foreign_keys = ON;
+  PRAGMA foreign_keys;
+  GO
+
+Настройки соединения, например foreign_keys, задавайте до начала транзакции. Некоторые PRAGMA действуют только на соединение, выполняются при подготовке запроса или не участвуют в откате. Не считайте, что CANCEL отменяет настройку PRAGMA.
+
+Сеанс работает с одной базой, выбранной при запуске. ATTACH/DETACH отключены. Для другого файла выйдите и запустите **dbcon --db <файл>** или **dbcon --config <файл>**.
 
 ## Ошибки и выход
 
-Ошибка печатается в оболочке, после неё можно вводить следующую команду. **QUIT** или **EXIT** завершает сеанс без GO. Конец потока ввода также завершает оболочку.
+Ошибка печатается в оболочке, после неё можно вводить следующую команду. **QUIT** или **EXIT** завершает сеанс без GO, если другая команда не набирается. Конец потока ввода также завершает оболочку. Несохранённые изменения откатываются без подтверждения; незавершённая команда без GO отбрасывается.
+
+**Команды в режиме чтения.** SAVE выдаёт ошибку и предлагает перезапуск с **-w**. CANCEL сообщает, что изменений не было и отмена не требуется; это информация, не ошибка. Команды транзакций/точек сохранения и PRAGMA, запрещённые в режиме чтения, объясняют необходимый режим доступа. ATTACH/DETACH подсказывают, как выбрать другую базу при запуске. Для неподдерживаемого **-d** предлагается **--delete**.
+
+**Диагностика SQLite.** Синтаксические ошибки и нарушения SQL-ограничений сохраняют исходные сообщения SQLite. При ошибках открытия/доступа выводятся путь базы, основной и расширенный коды SQLite и системная ошибка, если SQLite её предоставила. Дополнительный системный код — диагностическая информация, не гарантированное объяснение причины. По одной этой детали нельзя уверенно объявлять отсутствие файла, проблему прав или WAL.
+
+**Труба тоже запускает shell.** Если у dbcon не указано действие во флагах, выбирается оболочка, даже когда stdin приходит из трубы. Чтобы сохранить переданную через трубу SQL-запись, явно выполните сохранение:
+
+  printf '%s\n' "UPDATE users SET age=31 WHERE id=1; GO" SAVE | dbcon --db ./work.db -w
+
+Без SAVE или SQL COMMIT конец ввода откатывает накопленные изменения. Напротив, **dbcon --db ./work.db -w --update ...** — разовое действие, которое автоматически сохраняется при успехе.
 
 # КОНФИГУРАЦИЯ
 
@@ -582,12 +1042,12 @@ GO внутри кавычек является частью аргумента.
 
 Существующая корректная конфигурация выбирается без перезаписи. Для некорректной предлагается замена.
 
-**Параметры базы.** При создании укажите путь к существующей базе, затем **readOnly** и **busyTimeoutMilliseconds**. Enter оставляет показанное значение по умолчанию. Пустой или неверный путь к базе останавливает мастер без создания файлов. Относительный путь к базе считается от папки JSON.
+**Параметры базы.** При создании укажите путь к существующей базе и запрашиваемые настройки подключения. Enter оставляет показанные значения по умолчанию. Сохранённая конфигурация не заменяет явный **-w**, необходимый для записи. Пустой или неверный путь к базе останавливает мастер без создания файлов. Относительный путь к базе считается от папки JSON.
 
 ## Формат JSON
 
 **databasePath** — обязательный путь к существующей базе; **~** раскрывается, относительный путь считается от папки конфигурации.
-**readOnly** — режим доступа по умолчанию.
+**readOnly** — логическое поле, сохранённое для совместимости конфигурации; для записи всё равно нужен явный **-w** при запуске.
 **busyTimeoutMilliseconds** — ожидание занятой базы в миллисекундах, минимум **1000**.
 
   {
@@ -610,6 +1070,18 @@ GO внутри кавычек является частью аргумента.
 **settings.ini** необязателен и содержит одно присваивание **configPath=config.json**. Путь считается от **conf**. Строки, начинающиеся с **#** или **;**, игнорируются; другие записи не допускаются.
 
 Если бинарник находится в **bin**, папка **conf** соседняя с **bin**; иначе она располагается рядом с бинарником.
+
+## Файлы SQLite WAL и копирование активной базы
+
+В режиме WAL SQLite может создавать **work.db-wal** и **work.db-shm** рядом с **work.db**. WAL хранит изменённые страницы и записи фиксации транзакций; SHM — индекс и координацию доступа. Это служебные файлы SQLite, не дополнительные базы, выбранные dbcon. WAL-режим сохраняется в базе, поэтому копия также может его унаследовать. Пустой WAL сам по себе не является ошибкой.
+
+Режим чтения запрещает логическую запись данных, но SQLite всё равно может требоваться создание или доступ к служебным WAL/SHM. Не удаляйте их вручную, пока база используется. Активный WAL может содержать сохранённые данные, ещё не перенесённые в основной файл; копирование только основного файла через cp не является надёжной резервной копией активной базы.
+
+Для согласованной копии используйте SQLite backup. Команда требует установленную утилиту sqlite3 и не перезаписывает существующий целевой файл:
+
+  test ! -e ./work-copy.db && sqlite3 -readonly ./work.db ".backup './work-copy.db'"
+
+Затем откройте копию через **dbcon --db ./work-copy.db**. Не используйте immutable как обход проблемы для базы, которую другой процесс может изменять. Документация: https://www.sqlite.org/wal.html
 
 # СПРАВКА
 

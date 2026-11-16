@@ -9,8 +9,6 @@ import Darwin
 import Foundation
 
 enum Man {
-    static let connectionHint = "Add --db /path/base.db, select a configuration with --config <path>, or save a default with --set-config."
-
     static let help = """
     dbcon - SQLite database utility
 
@@ -25,12 +23,12 @@ enum Man {
       --db, -db <file>      Open a database directly.
       --config <file>       Use a configuration for this run.
       --set-config          Create or select the default configuration.
-      -r / -w               Read-only / read-write. Default: -r.
+      -r / -w               Read-only / read-write. Writing requires explicit -w.
       --timeout <ms>        Busy wait. Default 3000. Minimum 1000.
 
     ONE-SHOT
-      -t <table>            Table to read or search.
-      -c, --column <names>  Output fields; also limits plain-text search.
+      -t, --table <name>    Table to read, search, or modify.
+      -c, --column <names>  Output or insert fields; limits plain-text search.
                             JSON field: 'data:$.text'. Default: all.
       --columns -t <table>  List columns and their structure.
       --count -t <table>    Count rows. Can be combined with -s.
@@ -47,11 +45,36 @@ enum Man {
       -e, --eq, --equal     Match the whole value for all conditions.
       -ie                   Same as -i -e. Only these flags can be grouped.
 
+    EPISODE SEARCH (CLI and shell)
+      --find -t <table>     Ranked literal search; old -s remains unchanged.
+      --key <names>        Unique non-NULL key columns; -c selects text fields.
+      --require 'a|b'       Mandatory alternatives group; repeat for AND.
+      --phrase <text>      Mandatory phrase. --exclude <text> rejects a row.
+      --group-by <names>   Partition rows; --window <1..50> bounds an episode.
+      --element-type text  Filter [*] elements, e.g. 'data:$.content[*].text'.
+      --context --anchor <filter>  Read neighbors; --full returns original text.
+      --json               Structured output. Full options: --man.
+
+    WRITING (-w required)
+      -I, --insert          Insert into one table using --values <SQL list>.
+      -u, --update          Update one table using --set <SQL assignments>.
+      --delete              Delete rows. No short alias.
+      --where <expr>        Filter updates/deletes; omitted = all rows.
+                            CLI commits on success; shell uses SAVE / CANCEL.
+
     SHELL
       No action: interactive shell. GO executes; QUIT or EXIT leaves.
+      Prompt shows access mode once per command; no prompts with piped input.
+      SQLite SQL and flags; multiple SQL statements per GO, separated by ;.
+      SAVE / CANCEL commit / roll back pending changes; also work without GO.
+      SQL transactions and savepoints; PRAGMA maintenance in the shell only.
+      Exit or end of input rolls back unsaved changes.
+      In -r: SAVE requires -w; CANCEL reports that no changes were made.
 
     MCP
-      --mcp                Read-only MCP server over stdio (JSON-RPC).
+      --mcp -r             MCP over stdio: reading / reading and writing.
+      --mcp -w             Explicit -r or -w required; writes are atomic per call.
+                           OpenCode setup: --man, section "Connecting to OpenCode".
 
     EXAMPLE
       dbcon --db ./work.db -r -t session -c id,title -n 1000 -f
@@ -59,20 +82,6 @@ enum Man {
       -h, --help            Show this help.
       --man [en|ru]         Print the full manual.
     """
-
-    private enum ManualError: LocalizedError {
-        case missing
-        case missingSection(String)
-
-        var errorDescription: String? {
-            switch self {
-            case .missing:
-                return "Manual file Man.txt was not found."
-            case let .missingSection(language):
-                return "Manual file Man.txt has no \(language) section."
-            }
-        }
-    }
 
     static func manual(language: String) throws -> String {
         let text = try loadText()

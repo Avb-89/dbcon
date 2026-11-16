@@ -37,12 +37,12 @@ struct QuerySQL {
         if available.contains(field) { return quote(field) }
         guard let separator = field.range(of: ":$"),
               available.contains(String(field[..<separator.lowerBound])) else {
-            throw Arguments.ArgumentError.invalid("Unknown column or JSON field: \(field).")
+            throw Arguments.ArgumentError.invalid(Errors.Query.unknownField(field))
         }
         let column = quote(String(field[..<separator.lowerBound]))
         let path = String(field[field.index(after: separator.lowerBound)...])
         guard path == "$" || path.hasPrefix("$.") || path.hasPrefix("$[") else {
-            throw Arguments.ArgumentError.invalid("Invalid JSON path in \(field).")
+            throw Arguments.ArgumentError.invalid(Errors.Query.invalidJSONPath(field))
         }
         let literal = "'" + path.replacingOccurrences(of: "'", with: "''") + "'"
         return "CASE WHEN json_valid(\(column)) THEN json_extract(\(column), \(literal)) ELSE NULL END"
@@ -58,32 +58,16 @@ struct QuerySQL {
         exact: Bool
     ) throws {
         guard !columns.isEmpty, !columns.contains("*") || columns == ["*"] else {
-            throw Arguments.ArgumentError.invalid("Provide column names or '*' alone.")
+            throw Arguments.ArgumentError.invalid(Errors.Query.columnsRequired)
         }
         let selected = columns == ["*"] ? available : columns
         let expressions = try selected.map { try Self.expression($0, available: available) }
         if columns != ["*"] {
             projection = zip(expressions, selected).map { "\($0.0) AS \(Self.quote($0.1))" }.joined(separator: ", ")
         }
-        var filters: [String] = []
-        for term in terms {
-            let fields: [String]
-            let value: String
-            if let separator = term.firstIndex(of: "=") {
-                let field = String(term[..<separator])
-                guard !field.isEmpty else { throw Arguments.ArgumentError.invalid("Search field must not be empty.") }
-                fields = [try Self.expression(field, available: available)]
-                value = String(term[term.index(after: separator)...])
-            } else {
-                fields = expressions
-                value = term
-            }
-            let matches = fields.map { field in
-                parameters.append(.text(value))
-                return "dbcon_match(\(field), ?, \(ignoreCase ? 1 : 0), \(exact ? 1 : 0))"
-            }
-            filters.append("(" + (matches.isEmpty ? "0" : matches.joined(separator: " OR ")) + ")")
-        }
+        let search = try SearchPredicate.build(terms, expressions: expressions, available: available, ignoreCase: ignoreCase, exact: exact)
+        var filters = search.filters
+        parameters = search.parameters
         for condition in conditions {
             var parser = try WhereParser(condition, available: available)
             let parsed = try parser.parse()
@@ -94,21 +78,21 @@ struct QuerySQL {
         let sortFields = orderFields.flatMap { field in
             field.split(separator: ",", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         }
-        guard !sortFields.contains(where: \.isEmpty) else { throw Arguments.ArgumentError.invalid("--order-by contains an empty field.") }
+        guard !sortFields.contains(where: \.isEmpty) else { throw Arguments.ArgumentError.invalid(Errors.Query.emptySortField) }
         order = try sortFields.map { try Self.orderItem($0, available: available) }.joined(separator: ", ")
     }
 
     private static func orderItem(_ text: String, available: [String]) throws -> String {
         if available.contains(text) { return "\(quote(text)) ASC" }
         let parts = text.split(whereSeparator: \.isWhitespace).map(String.init)
-        guard !parts.isEmpty else { throw Arguments.ArgumentError.invalid("--order-by requires a field.") }
+        guard !parts.isEmpty else { throw Arguments.ArgumentError.invalid(Errors.Query.sortFieldRequired) }
         var direction = "ASC"
         var field = text
         if let last = parts.last?.uppercased(), last == "ASC" || last == "DESC" {
             direction = last
             field = String(text.dropLast(last.count)).trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        guard !field.isEmpty else { throw Arguments.ArgumentError.invalid("Invalid sort field: \(text).") }
+        guard !field.isEmpty else { throw Arguments.ArgumentError.invalid(Errors.Query.invalidSortField(text)) }
         return "\(try expression(field, available: available)) \(direction)"
     }
 }
@@ -126,7 +110,7 @@ private struct WhereParser {
 
     mutating func parse() throws -> String {
         let result = try parseOr()
-        guard index == tokens.count else { throw Arguments.ArgumentError.invalid("Unexpected text in --where.") }
+        guard index == tokens.count else { throw Arguments.ArgumentError.invalid(Errors.Query.unexpectedFilterText) }
         return result
     }
 
@@ -149,26 +133,26 @@ private struct WhereParser {
     private mutating func parsePrimary() throws -> String {
         if consume("(") {
             let inner = try parseOr()
-            guard consume(")") else { throw Arguments.ArgumentError.invalid("--where is missing a closing parenthesis.") }
+            guard consume(")") else { throw Arguments.ArgumentError.invalid(Errors.Query.missingParenthesis) }
             return "(\(inner))"
         }
         let field: String
         switch next() {
         case let .word(name)?, let .text(name)?: field = name
-        default: throw Arguments.ArgumentError.invalid("--where requires a field.")
+        default: throw Arguments.ArgumentError.invalid(Errors.Query.fieldRequired)
         }
         index += 1
         let expression = try QuerySQL.expression(field, available: available)
         if consumeWord("IS") {
             let negated = consumeWord("NOT")
-            guard consumeWord("NULL") else { throw Arguments.ArgumentError.invalid("--where requires NULL after IS.") }
+            guard consumeWord("NULL") else { throw Arguments.ArgumentError.invalid(Errors.Query.nullRequired) }
             return "\(expression) IS \(negated ? "NOT " : "")NULL"
         }
         guard let token = next(), case let .symbol(op) = token, ["=", "!=", "<>", ">", ">=", "<", "<="].contains(op) else {
-            throw Arguments.ArgumentError.invalid("--where requires an operator.")
+            throw Arguments.ArgumentError.invalid(Errors.Query.operatorRequired)
         }
         index += 1
-        guard let value = next() else { throw Arguments.ArgumentError.invalid("--where requires a value.") }
+        guard let value = next() else { throw Arguments.ArgumentError.invalid(Errors.Query.valueRequired) }
         index += 1
         parameters.append(try bound(value))
         return "\(expression) \(op == "<>" ? "!=" : op) ?"
@@ -180,18 +164,18 @@ private struct WhereParser {
             if let integer = Int64(text) { return .integer(integer) }
             guard text.contains(".") || text.lowercased().contains("e"),
                   let real = Double(text), real.isFinite else {
-                throw Arguments.ArgumentError.invalid("Invalid or out-of-range number in --where: \(text). Quote text values.")
+                throw Arguments.ArgumentError.invalid(Errors.Query.numberOutOfRange(text))
             }
             return .real(real)
         case let .text(text):
             return .text(text)
         case let .word(text):
             guard !["NULL", "AND", "OR", "IS", "NOT"].contains(text.uppercased()) else {
-                throw Arguments.ArgumentError.invalid("Use IS NULL / IS NOT NULL for nulls; quote keyword text values in --where.")
+                throw Arguments.ArgumentError.invalid(Errors.Query.keywordValue)
             }
             return .text(text)
         case .symbol:
-            throw Arguments.ArgumentError.invalid("--where requires a value after the operator.")
+            throw Arguments.ArgumentError.invalid(Errors.Query.valueAfterOperator)
         }
     }
 
@@ -236,7 +220,7 @@ private struct WhereParser {
                         else { closed = true; break }
                     } else { value.append(next) }
                 }
-                guard closed else { throw Arguments.ArgumentError.invalid("Unclosed quote in --where.") }
+                guard closed else { throw Arguments.ArgumentError.invalid(Errors.Query.unclosedQuote) }
                 tokens.append(.text(value))
                 continue
             }
@@ -254,10 +238,10 @@ private struct WhereParser {
                 word.append(next)
                 rest.removeFirst()
             }
-            guard !word.isEmpty else { throw Arguments.ArgumentError.invalid("Invalid --where syntax.") }
+            guard !word.isEmpty else { throw Arguments.ArgumentError.invalid(Errors.Query.invalidSyntax) }
             if let first = word.first, first.isNumber || "+-.".contains(first) {
                 guard word.range(of: "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$", options: .regularExpression) != nil else {
-                    throw Arguments.ArgumentError.invalid("Invalid number in --where: \(word). Quote text values.")
+                    throw Arguments.ArgumentError.invalid(Errors.Query.invalidNumber(word))
                 }
                 tokens.append(.number(word))
             } else {

@@ -15,20 +15,13 @@ final class DatabaseInspector {
         case full
     }
 
-    enum InspectionError: LocalizedError {
-        case sqlite(operation: String, message: String)
-
-        var errorDescription: String? {
-            switch self {
-            case let .sqlite(operation, message):
-                return "\(operation): \(message)"
-            }
-        }
-    }
-
-    private let database: OpaquePointer
-    private let databasePath: String
-    private let readOnly: Bool
+    let database: OpaquePointer
+    let databasePath: String
+    let readOnly: Bool
+    var checkingUserSQL = false
+    var allowsMaintenance = false
+    var sqlTransaction = false
+    var sqlDenial: String?
 
     init(databasePath: String, readOnly: Bool, busyTimeoutMilliseconds: Int32) throws {
         self.databasePath = databasePath
@@ -43,19 +36,18 @@ final class DatabaseInspector {
         )
 
         guard result == SQLITE_OK, let connection else {
-            let message = connection.map { String(cString: sqlite3_errmsg($0)) }
-                ?? "SQLite did not create a connection."
+            let error = Errors.sqliteFailure(operation: Errors.Database.opening, path: databasePath, database: connection, result: result)
             if let connection {
                 sqlite3_close(connection)
             }
-            throw InspectionError.sqlite(operation: "Opening database", message: message)
+            throw error
         }
 
         guard busyTimeoutMilliseconds >= 1000 else {
             sqlite3_close(connection)
             throw InspectionError.sqlite(
-                operation: "Setting busy timeout",
-                message: "busyTimeoutMilliseconds must be at least 1000."
+                operation: Errors.Database.timeout,
+                message: Errors.Database.timeoutMinimum
             )
         }
 
@@ -63,7 +55,7 @@ final class DatabaseInspector {
         guard timeoutResult == SQLITE_OK else {
             let message = String(cString: sqlite3_errmsg(connection))
             sqlite3_close(connection)
-            throw InspectionError.sqlite(operation: "Setting busy timeout", message: message)
+            throw InspectionError.sqlite(operation: Errors.Database.timeout, message: message)
         }
 
         database = connection
@@ -155,25 +147,6 @@ final class DatabaseInspector {
         }
     }
 
-    func searchTables(
-        tables: [String],
-        columns: [String],
-        queries: [String],
-        conditions: [String] = [],
-        orderFields: [String] = [],
-        ignoreCase: Bool,
-        exact: Bool,
-        compact: Bool = false,
-        rowLimit: Int? = nil
-    ) throws {
-        try registerSearch()
-        for table in try selectedTables(tables) {
-            let query = try QuerySQL(columns: columns, available: columnNames(table), terms: queries, conditions: conditions, orderFields: orderFields, ignoreCase: ignoreCase, exact: exact)
-            print("\nTABLE: \(table)")
-            try dumpRows("SELECT \(query.projection) FROM \(Self.quotedIdentifier(table)) WHERE \(query.filter)\(query.orderClause)\(Self.limitClause(rowLimit))", compact: compact, parameters: query.parameters)
-        }
-    }
-
     func countRows(tables: [String], columns: [String], nonEmpty: Bool, queries: [String] = [], conditions: [String] = [], ignoreCase: Bool = false, exact: Bool = false) throws {
         if !queries.isEmpty { try registerSearch() }
         var rows: [[String]] = []
@@ -210,21 +183,21 @@ final class DatabaseInspector {
         return names
     }
 
-    private func selectedTables(_ requested: [String]) throws -> [String] {
+    func selectedTables(_ requested: [String]) throws -> [String] {
         let available = try tableNames()
         if requested == ["*"] {
             return available
         }
         guard !requested.isEmpty else {
-            throw InspectionError.sqlite(operation: "Selecting tables", message: "Provide at least one table name.")
+            throw InspectionError.sqlite(operation: Errors.Database.selectingTables, message: Errors.Database.tablesRequired)
         }
         for table in requested where !available.contains(table) {
-            throw InspectionError.sqlite(operation: "Selecting tables", message: "Table '\(table)' does not exist.")
+            throw InspectionError.sqlite(operation: Errors.Database.selectingTables, message: Errors.Database.missingTable(table))
         }
         return requested
     }
 
-    private func dumpRows(_ sql: String, compact: Bool = false, parameters: [SQLValue] = []) throws {
+    func dumpRows(_ sql: String, compact: Bool = false, parameters: [SQLValue] = []) throws {
         if compact {
             try dumpCompact(sql, parameters: parameters)
             return
@@ -252,7 +225,7 @@ final class DatabaseInspector {
             }
         }
         guard result == SQLITE_OK, let preparedStatement else {
-            throw sqliteError("Preparing query \(sql)")
+            throw sqliteError(Errors.Database.preparingQuery(sql))
         }
         try bind(parameters, to: preparedStatement)
         let count = Int(sqlite3_column_count(preparedStatement))
@@ -273,7 +246,7 @@ final class DatabaseInspector {
                 print("\nTotal rows read: \(rows.count)")
                 return
             default:
-                throw sqliteError("Reading query result \(sql)")
+                throw sqliteError(Errors.Database.readingQuery(sql))
             }
         }
     }
@@ -342,7 +315,7 @@ final class DatabaseInspector {
         }
 
         guard result == SQLITE_OK, let preparedStatement else {
-            throw sqliteError("Preparing query \(sql)")
+            throw sqliteError(Errors.Database.preparingQuery(sql))
         }
 
         try bind(parameters, to: preparedStatement)
@@ -353,18 +326,14 @@ final class DatabaseInspector {
             case SQLITE_DONE:
                 return
             default:
-                throw sqliteError("Reading query result \(sql)")
+                throw sqliteError(Errors.Database.readingQuery(sql))
             }
         }
     }
 
-    private func sqliteError(_ operation: String) -> InspectionError {
-        .sqlite(operation: operation, message: String(cString: sqlite3_errmsg(database)))
-    }
-
-    private func bind(_ parameters: [SQLValue], to statement: OpaquePointer) throws {
+    func bind(_ parameters: [SQLValue], to statement: OpaquePointer) throws {
         guard Int(sqlite3_bind_parameter_count(statement)) == parameters.count else {
-            throw InspectionError.sqlite(operation: "Binding query", message: "Parameter count does not match the query.")
+            throw InspectionError.sqlite(operation: Errors.Database.binding, message: Errors.Database.parameterCount)
         }
         let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         for (index, value) in parameters.enumerated() {
@@ -378,26 +347,8 @@ final class DatabaseInspector {
             case let .real(number):
                 result = sqlite3_bind_double(statement, position, number)
             }
-            guard result == SQLITE_OK else { throw sqliteError("Binding query value") }
+            guard result == SQLITE_OK else { throw sqliteError(Errors.Database.bindingValue) }
         }
-    }
-
-    func registerSearch() throws {
-        let result = sqlite3_create_function(database, "dbcon_match", 4, SQLITE_UTF8, nil, { ctx, argc, argv in
-            guard let ctx, let argv, argc == 4 else { return }
-            guard sqlite3_value_type(argv[0]) != SQLITE_NULL,
-                  let raw = sqlite3_value_text(argv[0]), let needle = sqlite3_value_text(argv[1]) else {
-                sqlite3_result_int(ctx, 0)
-                return
-            }
-            let value = String(decoding: UnsafeBufferPointer(start: raw, count: Int(sqlite3_value_bytes(argv[0]))), as: UTF8.self)
-            let query = String(decoding: UnsafeBufferPointer(start: needle, count: Int(sqlite3_value_bytes(argv[1]))), as: UTF8.self)
-            let options: String.CompareOptions = sqlite3_value_int(argv[2]) != 0 ? .caseInsensitive : []
-            let exact = sqlite3_value_int(argv[3]) != 0
-            let matches = exact ? value.compare(query, options: options) == .orderedSame : query.isEmpty || value.range(of: query, options: options) != nil
-            sqlite3_result_int(ctx, matches ? 1 : 0)
-        }, nil, nil)
-        guard result == SQLITE_OK else { throw sqliteError("Preparing search") }
     }
 
     private static func limitClause(_ limit: Int?) -> String {
@@ -408,34 +359,38 @@ final class DatabaseInspector {
     func structuredRows(_ sql: String, parameters: [SQLValue] = []) throws -> [[String: Any]] {
         var rows: [[String: Any]] = []
         try forEachRow(sql, parameters: parameters) { statement in
-            var row: [String: Any] = [:]
-            for column in 0..<sqlite3_column_count(statement) {
-                let name = String(cString: sqlite3_column_name(statement, column))
-                switch sqlite3_column_type(statement, column) {
-                case SQLITE_NULL:
-                    row[name] = NSNull()
-                case SQLITE_INTEGER:
-                    row[name] = sqlite3_column_int64(statement, column)
-                case SQLITE_FLOAT:
-                    let number = sqlite3_column_double(statement, column)
-                    row[name] = number.isFinite ? number as Any : ["type": "real", "value": String(number)]
-                case SQLITE_BLOB:
-                    let count = Int(sqlite3_column_bytes(statement, column))
-                    let hex: String
-                    if let pointer = sqlite3_column_blob(statement, column), count > 0 {
-                        hex = UnsafeRawBufferPointer(start: pointer, count: count).map { String(format: "%02X", $0) }.joined()
-                    } else { hex = "" }
-                    row[name] = ["type": "blob", "hex": hex]
-                default:
-                    row[name] = Self.text(statement, column: column)
-                }
-            }
-            rows.append(row)
+            rows.append(Self.structuredRow(statement))
         }
         return rows
     }
 
-    private static func quotedIdentifier(_ name: String) -> String {
+    static func structuredRow(_ statement: OpaquePointer) -> [String: Any] {
+        var row: [String: Any] = [:]
+        for column in 0..<sqlite3_column_count(statement) {
+            let name = String(cString: sqlite3_column_name(statement, column))
+            switch sqlite3_column_type(statement, column) {
+            case SQLITE_NULL:
+                row[name] = NSNull()
+            case SQLITE_INTEGER:
+                row[name] = sqlite3_column_int64(statement, column)
+            case SQLITE_FLOAT:
+                let number = sqlite3_column_double(statement, column)
+                row[name] = number.isFinite ? number as Any : ["type": "real", "value": String(number)]
+            case SQLITE_BLOB:
+                let count = Int(sqlite3_column_bytes(statement, column))
+                let hex: String
+                if let pointer = sqlite3_column_blob(statement, column), count > 0 {
+                    hex = UnsafeRawBufferPointer(start: pointer, count: count).map { String(format: "%02X", $0) }.joined()
+                } else { hex = "" }
+                row[name] = ["type": "blob", "hex": hex]
+            default:
+                row[name] = Self.text(statement, column: column)
+            }
+        }
+        return row
+    }
+
+    static func quotedIdentifier(_ name: String) -> String {
         "\"" + name.replacingOccurrences(of: "\"", with: "\"\"") + "\""
     }
 
@@ -447,7 +402,7 @@ final class DatabaseInspector {
         return String(decoding: UnsafeBufferPointer(start: pointer, count: count), as: UTF8.self)
     }
 
-    private static func value(_ statement: OpaquePointer, column: Int32) -> String {
+    static func value(_ statement: OpaquePointer, column: Int32) -> String {
         switch sqlite3_column_type(statement, column) {
         case SQLITE_NULL:
             return "NULL"
